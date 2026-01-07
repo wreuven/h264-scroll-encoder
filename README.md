@@ -89,6 +89,24 @@ red, blue, green, yellow, cyan, magenta, white, black, gray
 
 ## Current Limitations
 
+### Hardware Decoder Motion Vector Limit (IMPORTANT)
+
+**NVDEC and some other hardware decoders have a hard limit of 512 pixels (2048 quarter-pel units) for vertical motion vectors, regardless of the H.264 level signaled in the SPS.**
+
+This encoder caps scroll offset at 31 macroblocks (496 pixels) to ensure hardware decoder compatibility. This means:
+
+- **Maximum scroll range**: ~69% of frame height (31/45 MB for 720p)
+- **Affected decoders**: NVDEC (NVIDIA), VAAPI, browser hardware decode, some mobile GPUs
+- **Symptom if exceeded**: Vertical color streaking/banding on the right side of frames
+
+If you need full-frame scrolling and only target software decoders (ffmpeg, VLC software mode), you can increase `max_offset_mb` in `src/main.c`, but the video will be corrupted on hardware decoders.
+
+```
+Level 3.1 spec limit:  512 px (2048 qpel)  - but NVDEC enforces this
+Level 4.0 spec limit: 2048 px (8192 qpel)  - NVDEC ignores this
+Hardware actual limit: 512 px (2048 qpel)  - hard limit regardless of level
+```
+
 ### 16-Pixel Scroll Granularity
 
 Scrolling occurs in 16-pixel increments (one macroblock row at a time). This is because:

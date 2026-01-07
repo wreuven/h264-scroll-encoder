@@ -63,8 +63,8 @@ size_t h264_generate_sps(uint8_t *rbsp, size_t capacity, int width, int height) 
     /* Match x264: constraint_set0=1, constraint_set1=1 */
     bitwriter_write_bits(&bw, 0xc0, 8);
 
-    /* level_idc: 31 = Level 3.1 (match x264) */
-    bitwriter_write_bits(&bw, 31, 8);
+    /* level_idc: 40 = Level 4.0 (required for vertical MV range > 512 pixels) */
+    bitwriter_write_bits(&bw, 40, 8);
 
     /* seq_parameter_set_id: ue(0) */
     bitwriter_write_ue(&bw, 0);
@@ -196,11 +196,28 @@ static void h264_write_p_slice_header(BitWriter *bw, H264EncoderConfig *cfg,
     bitwriter_write_ue(bw, 1);
 
     /* ref_pic_list_modification (for P-slices) */
-    /* With only long-term references in DPB, default RefPicList0 is built from
+    /* With only long-term references in DPB, default RefPicList0 should be built from
      * long-term pics in ascending order of long_term_pic_num: [A(ltp=0), B(ltp=1)]
-     * This is exactly what we need, so no modification required. */
-    /* ref_pic_list_modification_flag_l0: u(1) = 0 */
-    bitwriter_write_bit(bw, 0);
+     *
+     * However, some hardware decoders may not handle long-term-only reference lists
+     * correctly. We add EXPLICIT modification to ensure consistent behavior:
+     *
+     * modification_of_pic_nums_idc=2 means: use long_term_pic_num
+     * We specify LongTermPicNum 0 (A) first, then LongTermPicNum 1 (B)
+     */
+    /* ref_pic_list_modification_flag_l0: u(1) = 1 */
+    bitwriter_write_bit(bw, 1);
+
+    /* First entry: LongTermPicNum 0 (A) at refIdxL0 0 */
+    bitwriter_write_ue(bw, 2);  /* modification_of_pic_nums_idc = 2 (long_term_pic_num) */
+    bitwriter_write_ue(bw, 0);  /* long_term_pic_num = 0 */
+
+    /* Second entry: LongTermPicNum 1 (B) at refIdxL0 1 */
+    bitwriter_write_ue(bw, 2);  /* modification_of_pic_nums_idc = 2 (long_term_pic_num) */
+    bitwriter_write_ue(bw, 1);  /* long_term_pic_num = 1 */
+
+    /* End of modification */
+    bitwriter_write_ue(bw, 3);  /* modification_of_pic_nums_idc = 3 (end) */
 
     /* dec_ref_pic_marking() - only for reference pictures (nal_ref_idc != 0) */
     if (is_reference) {
@@ -464,13 +481,7 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
              * TODO: Investigate why P_Skip causes artifacts at region boundaries. */
             int can_skip = 0;
 
-            /* Debug: show first B region MB */
-            if (mb_x == 0 && mb_y == a_region_end && cfg->frame_num >= 2 && cfg->frame_num <= 20) {
-                int ref_pos = mb_y * 16 + mv_y;  /* Where we read from in B */
-                fprintf(stderr, "Frame %d: offset=%d, B_start=%d, mv_y=%d px (%d qpel), pred=(%d,%d), mvd=(%d,%d), reading B@%d\n",
-                        cfg->frame_num, offset_mb, a_region_end, mv_y, mv_y_qpel,
-                        pred_mvx, pred_mvy, mvd_x, mvd_y, ref_pos);
-            }
+            /* Debug disabled - was showing MV values for high offset frames */
 
             if (can_skip) {
                 skip_count++;

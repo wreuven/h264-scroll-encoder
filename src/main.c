@@ -382,15 +382,25 @@ int main(int argc, char *argv[]) {
     /* Generate scroll P-frames */
     int mb_height = height / 16;
 
+    /*
+     * NVDEC hardware limit: max MV is 512 pixels (2048 qpel) regardless of H.264 level.
+     * To ensure hardware compatibility, cap scroll offset at 31 MB (496 pixels MV).
+     * This limits scroll to ~69% of frame height but avoids decoder corruption.
+     */
+    int max_offset_mb = 31;  /* 31 * 16 = 496 pixels = 1984 qpel < 2048 limit */
+    if (max_offset_mb > mb_height - 1) {
+        max_offset_mb = mb_height - 1;
+    }
+
     for (int i = 0; i < num_frames; i++) {
-        /* Calculate scroll offset: go from 0 to mb_height and back */
-        int cycle_pos = i % (mb_height * 2);
+        /* Calculate scroll offset: go from 0 to max_offset and back */
+        int cycle_pos = i % (max_offset_mb * 2);
         int offset_mb;
 
-        if (cycle_pos < mb_height) {
+        if (cycle_pos < max_offset_mb) {
             offset_mb = cycle_pos;  /* Scrolling down (A up, B appears) */
         } else {
-            offset_mb = mb_height * 2 - cycle_pos;  /* Scrolling back */
+            offset_mb = max_offset_mb * 2 - cycle_pos;  /* Scrolling back */
         }
 
         h264_write_scroll_p_frame(&nw, &cfg, offset_mb);
