@@ -148,7 +148,11 @@ To support arbitrarily long videos without frame_num wrapping issues:
 
 This allows infinite-length scrolling videos without the flashing artifacts that would occur with short-term references when `frame_num` wraps.
 
-## MV Prediction Optimization
+## P-Frame Optimizations
+
+This encoder implements two key optimizations for minimal P-frame sizes.
+
+### MV Prediction
 
 H.264 encodes motion vector differences (MVD) relative to a predicted MV from neighboring macroblocks. This encoder implements proper median MV prediction:
 
@@ -156,27 +160,34 @@ H.264 encodes motion vector differences (MVD) relative to a predicted MV from ne
 - **Algorithm**: Median of available neighbor MVs
 
 Since all macroblocks in a row have identical motion vectors:
-- First MB in row: encodes full MV (~25 bits)
-- Remaining MBs: `mvd = (0,0)` since prediction matches actual (~5 bits)
+- First MB in row: encodes full MV
+- Remaining MBs: `mvd = (0,0)` since prediction matches actual
 
-**Result**: 74% smaller P-frames compared to naive encoding (no prediction).
+### P_Skip Macroblocks
 
-### P-Frame Size (1280x720)
+When a macroblock meets these conditions, it can be "skipped" entirely:
+- `ref_idx = 0` (references first long-term picture)
+- `mvd = (0, 0)` (motion vector matches prediction)
 
-| Component | Without MV Pred | With MV Pred |
-|-----------|-----------------|--------------|
-| Per P-frame | ~11.5 KB | ~3.0 KB |
-| 10s video (248 P-frames) | ~2.85 MB | ~0.74 MB |
+Skipped macroblocks only increment `mb_skip_run`—no mb_type, ref_idx, mvd, or cbp is written. In our scroll pattern, consecutive macroblocks in the same row (after the first) are all skippable.
 
-### Encoding per Macroblock
+### Size Comparison (1280x720)
+
+| Optimization | Per P-frame | 10s video (248 frames) | Reduction |
+|--------------|-------------|------------------------|-----------|
+| Naive (no prediction) | ~11.5 KB | ~2.85 MB | — |
+| + MV Prediction | ~3.0 KB | ~0.74 MB | 74% |
+| + P_Skip | ~1.7 KB | ~0.42 MB | 86% |
+
+### What Gets Encoded
+
+For each P-frame row:
+- **First MB**: Full encoding (mb_skip_run, mb_type, ref_idx, mvd, cbp)
+- **Remaining MBs**: Either P_Skip (just adds to skip count) or minimal encoding with `mvd=(0,0)`
 
 ```
-mb_skip_run:  ue(0) = 1 bit    (no skipped MBs)
-mb_type:      ue(0) = 1 bit    (P_L0_16x16)
-ref_idx:      te(1) = 1 bit    (which reference frame)
-mvd_x:        se(v)  = 1+ bits (usually 1 bit when predicted)
-mvd_y:        se(v)  = 1+ bits (usually 1 bit when predicted)
-cbp:          ue(0) = 1 bit    (no residual)
+Coded MB:      ~6 bits (mb_skip_run + mb_type + ref_idx + mvd + cbp)
+Skipped MB:    0 bits (rolled into next mb_skip_run)
 ```
 
 ## License

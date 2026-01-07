@@ -355,6 +355,9 @@ static void get_mv_prediction_ex(int mb_x, int mb_y, int mb_width,
 
 /*
  * Write a complete P-frame for scrolling composition
+ *
+ * Uses P_Skip optimization: when ref_idx=0 and mvd=(0,0), the macroblock
+ * can be skipped entirely - just increment mb_skip_run counter.
  */
 size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_mb) {
     uint8_t rbsp[1024 * 1024];  /* 1MB should be plenty for slice data */
@@ -384,6 +387,8 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
     MVInfo *current_row = calloc(cfg->mb_width, sizeof(MVInfo));
     MVInfo left = {0};
 
+    int skip_count = 0;  /* Count of consecutive P_Skip macroblocks */
+
     for (int mb_y = 0; mb_y < cfg->mb_height; mb_y++) {
         left.available = 0;  /* Reset left at start of each row */
 
@@ -411,16 +416,30 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
             get_mv_prediction_ex(mb_x, mb_y, cfg->mb_width, above_row, &left,
                                  &pred_mvx, &pred_mvy);
 
-            /* Write MB with delta from prediction */
+            /* Calculate MVD */
             int mvd_x = mv_x_qpel - pred_mvx;
             int mvd_y = mv_y_qpel - pred_mvy;
 
-            /* For CAVLC P-slices, must write mb_skip_run before each macroblock */
-            /* mb_skip_run = 0 means "no skipped MBs, next is a coded MB" */
-            bitwriter_write_ue(&bw, 0);
+            /*
+             * P_Skip optimization:
+             * A macroblock can be skipped if:
+             * - ref_idx = 0 (uses first reference)
+             * - mvd = (0, 0) (MV equals prediction)
+             *
+             * Skipped MBs inherit ref_idx=0 and predicted MV, with no residual.
+             */
+            int can_skip = (ref_idx == 0) && (mvd_x == 0) && (mvd_y == 0);
 
-            /* Now write the macroblock (mvd is already in quarter-pel) */
-            h264_write_p16x16_mb_qpel(&bw, ref_idx, mvd_x, mvd_y);
+            if (can_skip) {
+                skip_count++;
+            } else {
+                /* Write accumulated skip count, then the coded MB */
+                bitwriter_write_ue(&bw, skip_count);
+                skip_count = 0;
+
+                /* Write the macroblock (mvd is already in quarter-pel) */
+                h264_write_p16x16_mb_qpel(&bw, ref_idx, mvd_x, mvd_y);
+            }
 
             /* Update MV tracking for next MB's prediction */
             current_row[mb_x].mv_x = mv_x_qpel;
@@ -435,6 +454,12 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
         MVInfo *tmp = above_row;
         above_row = current_row;
         current_row = tmp;
+    }
+
+    /* Write any remaining skip count at end of slice */
+    if (skip_count > 0) {
+        bitwriter_write_ue(&bw, skip_count);
+        skip_count = 0;
     }
 
     free(above_row);
