@@ -13,7 +13,7 @@ void h264_encoder_init(H264EncoderConfig *cfg, int width, int height) {
     cfg->idr_pic_id = 0;
 
     /* Defaults - will be overridden if loading from external SPS */
-    cfg->log2_max_frame_num = 4;        /* max_frame_num = 16 */
+    cfg->log2_max_frame_num = 9;        /* max_frame_num = 512 (enough for 20s at 25fps) */
     cfg->pic_order_cnt_type = 2;        /* POC derived from frame_num */
     cfg->log2_max_pic_order_cnt_lsb = 4;
 
@@ -68,8 +68,8 @@ size_t h264_generate_sps(uint8_t *rbsp, size_t capacity, int width, int height) 
     /* seq_parameter_set_id: ue(0) */
     bitwriter_write_ue(&bw, 0);
 
-    /* log2_max_frame_num_minus4: ue(0) -> max_frame_num = 16 */
-    bitwriter_write_ue(&bw, 0);
+    /* log2_max_frame_num_minus4: ue(5) -> log2=9 -> max_frame_num = 512 */
+    bitwriter_write_ue(&bw, 5);
 
     /* pic_order_cnt_type: ue(2) -> POC = 2*frame_num for frames */
     bitwriter_write_ue(&bw, 2);
@@ -303,7 +303,7 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
     int max_frame_num = 1 << cfg->log2_max_frame_num;
     int frame_num = cfg->frame_num % max_frame_num;
 
-    /* Write slice header - is_reference=0 since this is a non-reference P-frame */
+    /* Write slice header - is_reference=0 for non-reference P-frames */
     h264_write_p_slice_header(&bw, cfg, 0, frame_num, frame_num * 2, 0);
 
     /*
@@ -382,11 +382,11 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
     size_t rbsp_size = bitwriter_get_size(&bw);
 
     /* Write as non-IDR slice NAL unit */
-    /* nal_ref_idc = 0 (NON-reference picture) - keeps only I-frames in DPB */
+    /* nal_ref_idc = 0 (non-reference) - keeps only I-frames in DPB */
     size_t written = nal_write_unit(nw, NAL_REF_IDC_NONE, NAL_TYPE_SLICE,
                                     rbsp, rbsp_size, 1);
 
-    /* Still increment frame_num for non-reference pictures */
+    /* Increment frame_num */
     cfg->frame_num++;
     return written;
 }
