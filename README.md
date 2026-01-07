@@ -148,6 +148,37 @@ To support arbitrarily long videos without frame_num wrapping issues:
 
 This allows infinite-length scrolling videos without the flashing artifacts that would occur with short-term references when `frame_num` wraps.
 
+## MV Prediction Optimization
+
+H.264 encodes motion vector differences (MVD) relative to a predicted MV from neighboring macroblocks. This encoder implements proper median MV prediction:
+
+- **Prediction sources**: Left (A), Above (B), Above-right (C) neighbors
+- **Algorithm**: Median of available neighbor MVs
+
+Since all macroblocks in a row have identical motion vectors:
+- First MB in row: encodes full MV (~25 bits)
+- Remaining MBs: `mvd = (0,0)` since prediction matches actual (~5 bits)
+
+**Result**: 74% smaller P-frames compared to naive encoding (no prediction).
+
+### P-Frame Size (1280x720)
+
+| Component | Without MV Pred | With MV Pred |
+|-----------|-----------------|--------------|
+| Per P-frame | ~11.5 KB | ~3.0 KB |
+| 10s video (248 P-frames) | ~2.85 MB | ~0.74 MB |
+
+### Encoding per Macroblock
+
+```
+mb_skip_run:  ue(0) = 1 bit    (no skipped MBs)
+mb_type:      ue(0) = 1 bit    (P_L0_16x16)
+ref_idx:      te(1) = 1 bit    (which reference frame)
+mvd_x:        se(v)  = 1+ bits (usually 1 bit when predicted)
+mvd_y:        se(v)  = 1+ bits (usually 1 bit when predicted)
+cbp:          ue(0) = 1 bit    (no residual)
+```
+
 ## License
 
 MIT License
