@@ -223,7 +223,7 @@ static void h264_write_p_slice_header(BitWriter *bw, H264EncoderConfig *cfg,
  *
  * mb_type = 0 (P_L0_16x16)
  * ref_idx_l0 = ref_idx (if more than 1 ref active)
- * mvd_l0 = motion vector delta
+ * mvd_l0 = motion vector delta (in full-pel, will be converted to quarter-pel)
  * coded_block_pattern = 0 (no residual)
  */
 void h264_write_p16x16_mb(BitWriter *bw, int ref_idx, int mvd_x, int mvd_y) {
@@ -242,13 +242,8 @@ void h264_write_p16x16_mb(BitWriter *bw, int ref_idx, int mvd_x, int mvd_y) {
     /* mvd_l0[0][1]: se(mvd_y) - vertical */
     bitwriter_write_se(bw, mvd_y * 4);
 
-    /* coded_block_pattern is NOT written for P_L0_16x16 with no residual */
-    /* Instead, mb_type implicitly signals no CBP when it's the base type */
-
-    /* Actually, for P_L0_16x16, we need to write coded_block_pattern */
     /* coded_block_pattern: me(v) = 0 (no luma or chroma residual) */
-    /* For inter MBs, CBP 0 is coded as me(0) */
-    /* me(v) for inter is mapped differently - CBP 0 -> codeNum 0 */
+    /* For inter MBs, CBP 0 -> codeNum 0 */
     bitwriter_write_ue(bw, 0);  /* CBP = 0, no residual */
 
     /* No mb_qp_delta since CBP = 0 */
@@ -256,39 +251,106 @@ void h264_write_p16x16_mb(BitWriter *bw, int ref_idx, int mvd_x, int mvd_y) {
 }
 
 /*
+ * Write P16x16 macroblock with MVD already in quarter-pel units
+ * Used when MV prediction is computed in quarter-pel
+ */
+static void h264_write_p16x16_mb_qpel(BitWriter *bw, int ref_idx, int mvd_x_qpel, int mvd_y_qpel) {
+    /* mb_type: ue(0) = P_L0_16x16 */
+    bitwriter_write_ue(bw, 0);
+
+    /* ref_idx_l0[0]: te(1) */
+    bitwriter_write_bit(bw, 1 - (ref_idx & 1));
+
+    /* mvd_l0[0][0]: se(mvd_x) - already in quarter-pel */
+    bitwriter_write_se(bw, mvd_x_qpel);
+
+    /* mvd_l0[0][1]: se(mvd_y) - already in quarter-pel */
+    bitwriter_write_se(bw, mvd_y_qpel);
+
+    /* coded_block_pattern: ue(0) = no residual */
+    bitwriter_write_ue(bw, 0);
+}
+
+/*
  * Motion vector prediction for P16x16
  *
- * Simplified: for the first MB or when neighbors have different refs,
- * we often get (0,0) prediction. For a clean implementation, we compute
- * the median of A (left), B (above), C (above-right) MVs.
+ * H.264 uses median prediction from neighbors A (left), B (above), C (above-right).
+ * If C is unavailable, use D (above-left) instead.
  *
- * For simplicity in this generator, we use the fact that:
- * - All our MBs use the same MV pattern per row
- * - We can compute expected prediction and write the delta
+ * For our scroll encoder, all MBs in a row have the same MV, so:
+ * - mb_x > 0: left neighbor has same MV → prediction matches → mvd = (0,0)
+ * - mb_x = 0: predict from above row (may differ at A/B region boundary)
+ *
+ * This dramatically reduces P-frame size since most MBs encode mvd=(0,0).
  */
-static void get_mv_prediction(H264EncoderConfig *cfg, int mb_x, int mb_y,
-                              int ref_idx, int *pred_mvx, int *pred_mvy,
-                              int offset_mb) {
-    /*
-     * Simplified prediction:
-     * - First MB (0,0): prediction is (0,0)
-     * - Left edge (mb_x == 0): use above if available
-     * - Others: median of left, above, above-right
-     *
-     * Since all our P-frames have uniform motion per row,
-     * the prediction often matches our MV, giving delta of 0.
-     *
-     * For now, assume prediction is (0,0) and write full MV as delta.
-     * This is valid but less efficient. Can be optimized later.
-     */
-    (void)cfg;
-    (void)mb_x;
-    (void)mb_y;
-    (void)ref_idx;
-    (void)offset_mb;
+static int median3(int a, int b, int c) {
+    if (a > b) { int t = a; a = b; b = t; }
+    if (b > c) { b = c; }
+    if (a > b) { a = b; }
+    return b > a ? b : a;
+}
 
-    *pred_mvx = 0;
-    *pred_mvy = 0;
+typedef struct {
+    int mv_x, mv_y;
+    int ref_idx;
+    int available;
+} MVInfo;
+
+static void get_mv_prediction_ex(int mb_x, int mb_y, int mb_width,
+                                  const MVInfo *above_row, const MVInfo *left,
+                                  int *pred_mvx, int *pred_mvy) {
+    /*
+     * H.264 MV prediction for P16x16:
+     * A = left, B = above, C = above-right (or D = above-left if C unavailable)
+     *
+     * If only one is available, use it.
+     * Otherwise, use median(A, B, C).
+     */
+    MVInfo a = {0}, b = {0}, c = {0};
+
+    /* A: left neighbor */
+    if (mb_x > 0 && left->available) {
+        a = *left;
+        a.available = 1;
+    }
+
+    /* B: above neighbor */
+    if (mb_y > 0 && above_row[mb_x].available) {
+        b = above_row[mb_x];
+        b.available = 1;
+    }
+
+    /* C: above-right neighbor (not available for rightmost column) */
+    if (mb_y > 0 && mb_x + 1 < mb_width && above_row[mb_x + 1].available) {
+        c = above_row[mb_x + 1];
+        c.available = 1;
+    } else if (mb_y > 0 && mb_x > 0 && above_row[mb_x - 1].available) {
+        /* D: above-left as fallback */
+        c = above_row[mb_x - 1];
+        c.available = 1;
+    }
+
+    int num_available = a.available + b.available + c.available;
+
+    if (num_available == 0) {
+        *pred_mvx = 0;
+        *pred_mvy = 0;
+    } else if (num_available == 1) {
+        if (a.available) { *pred_mvx = a.mv_x; *pred_mvy = a.mv_y; }
+        else if (b.available) { *pred_mvx = b.mv_x; *pred_mvy = b.mv_y; }
+        else { *pred_mvx = c.mv_x; *pred_mvy = c.mv_y; }
+    } else {
+        /* Median of available MVs (treat unavailable as 0) */
+        int ax = a.available ? a.mv_x : 0;
+        int ay = a.available ? a.mv_y : 0;
+        int bx = b.available ? b.mv_x : 0;
+        int by = b.available ? b.mv_y : 0;
+        int cx = c.available ? c.mv_x : 0;
+        int cy = c.available ? c.mv_y : 0;
+
+        *pred_mvx = median3(ax, bx, cx);
+        *pred_mvy = median3(ay, by, cy);
+    }
 }
 
 /*
@@ -308,34 +370,8 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
 
     /*
      * Scroll composition logic:
-     *
-     * With "B scrolls in" behavior:
-     * - Image A is conceptually above image B in a tall virtual canvas
      * - offset_mb = 0: show all of A
      * - offset_mb = mb_height: show all of B
-     *
-     * For each output row mb_y:
-     *   source_row = mb_y + offset_mb
-     *   if source_row < mb_height:
-     *     use ref A at row source_row
-     *     MV_y = (source_row - mb_y) * 16 = offset_mb * 16
-     *   else:
-     *     use ref B at row (source_row - mb_height)
-     *     MV_y = (source_row - mb_height - mb_y) * 16 = (offset_mb - mb_height) * 16
-     *
-     * Since we want the content to scroll UP (A moves up, B appears from below):
-     * - MV_y for A region: -offset_mb * 16 (negative = content from higher Y)
-     * - Wait, let me reconsider...
-     *
-     * Actually for motion compensation:
-     * - reconstructed[x,y] = reference[x + mvx, y + mvy]
-     * - If we want output row 0 to show reference row offset_mb:
-     *   MV_y = offset_mb (positive)
-     *
-     * Let me define clearly:
-     * - offset_mb = 0: output shows A as-is
-     * - offset_mb = N: output row 0 shows A row N, output row (mb_height-N-1) shows A row (mb_height-1)
-     *                  output row (mb_height-N) shows B row 0, etc.
      *
      * Boundary: A region is rows [0, mb_height - offset_mb)
      *           B region is rows [mb_height - offset_mb, mb_height)
@@ -343,7 +379,14 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
 
     int a_region_end = cfg->mb_height - offset_mb;  /* First row of B region */
 
+    /* Allocate MV tracking arrays for prediction */
+    MVInfo *above_row = calloc(cfg->mb_width, sizeof(MVInfo));
+    MVInfo *current_row = calloc(cfg->mb_width, sizeof(MVInfo));
+    MVInfo left = {0};
+
     for (int mb_y = 0; mb_y < cfg->mb_height; mb_y++) {
+        left.available = 0;  /* Reset left at start of each row */
+
         for (int mb_x = 0; mb_x < cfg->mb_width; mb_x++) {
             int ref_idx;
             int mv_y;
@@ -351,32 +394,51 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
 
             if (mb_y < a_region_end) {
                 /* A region: reference A (long-term ref with LongTermPicNum=0 = ref_idx 0) */
-                /* Fetch from row (mb_y + offset_mb) */
                 ref_idx = 0;
                 mv_y = offset_mb * 16;  /* Convert MB offset to pixels */
             } else {
                 /* B region: reference B (long-term ref with LongTermPicNum=1 = ref_idx 1) */
-                /* Fetch from row (mb_y - a_region_end) */
                 ref_idx = 1;
                 mv_y = (offset_mb - cfg->mb_height) * 16;  /* Negative offset in pixels */
             }
 
-            /* Get MV prediction (currently returns 0,0) */
+            /* MVs are in quarter-pel in the bitstream, so multiply by 4 */
+            int mv_x_qpel = mv_x * 4;
+            int mv_y_qpel = mv_y * 4;
+
+            /* Get MV prediction using neighbor information */
             int pred_mvx, pred_mvy;
-            get_mv_prediction(cfg, mb_x, mb_y, ref_idx, &pred_mvx, &pred_mvy, offset_mb);
+            get_mv_prediction_ex(mb_x, mb_y, cfg->mb_width, above_row, &left,
+                                 &pred_mvx, &pred_mvy);
 
             /* Write MB with delta from prediction */
-            int mvd_x = mv_x - pred_mvx;
-            int mvd_y = mv_y - pred_mvy;
+            int mvd_x = mv_x_qpel - pred_mvx;
+            int mvd_y = mv_y_qpel - pred_mvy;
 
             /* For CAVLC P-slices, must write mb_skip_run before each macroblock */
             /* mb_skip_run = 0 means "no skipped MBs, next is a coded MB" */
             bitwriter_write_ue(&bw, 0);
 
-            /* Now write the macroblock */
-            h264_write_p16x16_mb(&bw, ref_idx, mvd_x, mvd_y);
+            /* Now write the macroblock (mvd is already in quarter-pel) */
+            h264_write_p16x16_mb_qpel(&bw, ref_idx, mvd_x, mvd_y);
+
+            /* Update MV tracking for next MB's prediction */
+            current_row[mb_x].mv_x = mv_x_qpel;
+            current_row[mb_x].mv_y = mv_y_qpel;
+            current_row[mb_x].ref_idx = ref_idx;
+            current_row[mb_x].available = 1;
+
+            left = current_row[mb_x];
         }
+
+        /* Swap rows: current becomes above for next row */
+        MVInfo *tmp = above_row;
+        above_row = current_row;
+        current_row = tmp;
     }
+
+    free(above_row);
+    free(current_row);
 
     bitwriter_write_trailing_bits(&bw);
     size_t rbsp_size = bitwriter_get_size(&bw);
