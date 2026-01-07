@@ -120,10 +120,10 @@ static int write_file(const char *filename, const uint8_t *data, size_t size) {
 int main(int argc, char *argv[]) {
     const char *input_file = NULL;
     const char *output_file = "output.h264";
-    int num_frames = 60;
+    int num_frames = 900;  /* 30 seconds at 30fps */
     int width = 0, height = 0;
-    int test_mode = 0;
-    int striped_mode = 0;
+    int test_mode = 1;     /* Default to test mode */
+    int striped_mode = 1;  /* Default to striped */
     const char *color_a_name = "gray";
     const char *color_b_name = "gray";
 
@@ -144,7 +144,7 @@ int main(int argc, char *argv[]) {
     int c;
     while ((c = getopt_long(argc, argv, "i:o:n:w:H:ts", long_options, NULL)) != -1) {
         switch (c) {
-            case 'i': input_file = optarg; break;
+            case 'i': input_file = optarg; test_mode = 0; break;
             case 'o': output_file = optarg; break;
             case 'n': num_frames = atoi(optarg); break;
             case 'w': width = atoi(optarg); break;
@@ -351,7 +351,7 @@ int main(int argc, char *argv[]) {
         x264_cfg.deblocking_filter_control_present_flag = x264_deblock_flag;
 
         /* Set our cfg to use our SPS params for writing */
-        cfg.log2_max_frame_num = 9;  /* Our SPS uses log2_max_frame_num = 9 */
+        cfg.log2_max_frame_num = 4;  /* Our SPS uses log2_max_frame_num = 4 */
         cfg.pic_order_cnt_type = 2;  /* Our SPS uses poc_type = 2 */
         cfg.deblocking_filter_control_present_flag = 1;  /* Our PPS has this set */
 

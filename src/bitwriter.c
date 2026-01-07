@@ -122,6 +122,11 @@ void bitwriter_flush(BitWriter *bw) {
 }
 
 size_t bitwriter_get_size(BitWriter *bw) {
+    /* Flush partial byte to buffer if there are remaining bits */
+    if (bw->bit_pos > 0) {
+        /* Shift remaining bits to MSB positions and pad with zeros */
+        bw->buffer[bw->byte_pos] = bw->current_byte << (8 - bw->bit_pos);
+    }
     return bw->byte_pos + (bw->bit_pos > 0 ? 1 : 0);
 }
 

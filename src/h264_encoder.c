@@ -14,7 +14,7 @@ void h264_encoder_init(H264EncoderConfig *cfg, int width, int height) {
     cfg->idr_pic_id = 0;
 
     /* Defaults - will be overridden if loading from external SPS */
-    cfg->log2_max_frame_num = 9;        /* max_frame_num = 512 (enough for 20s at 25fps) */
+    cfg->log2_max_frame_num = 4;        /* max_frame_num = 16 */
     cfg->pic_order_cnt_type = 2;        /* POC derived from frame_num */
     cfg->log2_max_pic_order_cnt_lsb = 4;
 
@@ -69,8 +69,8 @@ size_t h264_generate_sps(uint8_t *rbsp, size_t capacity, int width, int height) 
     /* seq_parameter_set_id: ue(0) */
     bitwriter_write_ue(&bw, 0);
 
-    /* log2_max_frame_num_minus4: ue(5) -> log2=9 -> max_frame_num = 512 */
-    bitwriter_write_ue(&bw, 5);
+    /* log2_max_frame_num_minus4: ue(0) -> log2=4 -> max_frame_num = 16 */
+    bitwriter_write_ue(&bw, 0);
 
     /* pic_order_cnt_type: ue(2) -> POC = 2*frame_num for frames */
     bitwriter_write_ue(&bw, 2);
@@ -961,6 +961,7 @@ size_t h264_rewrite_idr_frame_ex(NALWriter *nw, H264EncoderConfig *write_cfg,
     copy_bits(&bw, rbsp, rbsp_size, hdr.mb_data_start_bit, mb_data_bits);
 
     size_t out_size = bitwriter_get_size(&bw);
+
     size_t written = nal_write_unit(nw, NAL_REF_IDC_HIGHEST, NAL_TYPE_IDR,
                                     out_rbsp, out_size, 1);
 
