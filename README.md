@@ -110,6 +110,10 @@ Test mode generates solid color I-frames using I_PCM macroblocks. For real image
 - Use an external encoder (x264) to create the reference I-frames
 - Implement proper intra prediction with DCT coefficients
 
+### No B-Frames
+
+This encoder uses H.264 Baseline profile which doesn't support B-frames. Only I-frames and P-frames are used. B-frames wouldn't benefit our use case anyway since we only reference two static images rather than temporally adjacent frames.
+
 ### No Audio Support
 
 This encoder generates video-only H.264 elementary streams.
