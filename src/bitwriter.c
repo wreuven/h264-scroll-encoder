@@ -132,3 +132,87 @@ size_t bitwriter_get_bit_position(BitWriter *bw) {
 int bitwriter_is_byte_aligned(BitWriter *bw) {
     return bw->bit_pos == 0;
 }
+
+/*
+ * BitReader implementation
+ */
+
+void bitreader_init(BitReader *br, const uint8_t *buffer, size_t size) {
+    br->buffer = buffer;
+    br->size = size;
+    br->byte_pos = 0;
+    br->bit_pos = 0;
+}
+
+int bitreader_read_bit(BitReader *br) {
+    if (br->byte_pos >= br->size) {
+        return 0;  /* EOF - return 0 */
+    }
+
+    int bit = (br->buffer[br->byte_pos] >> (7 - br->bit_pos)) & 1;
+    br->bit_pos++;
+
+    if (br->bit_pos == 8) {
+        br->byte_pos++;
+        br->bit_pos = 0;
+    }
+
+    return bit;
+}
+
+uint32_t bitreader_read_bits(BitReader *br, int n) {
+    uint32_t value = 0;
+
+    for (int i = 0; i < n; i++) {
+        value = (value << 1) | bitreader_read_bit(br);
+    }
+
+    return value;
+}
+
+uint32_t bitreader_read_ue(BitReader *br) {
+    /* Count leading zeros */
+    int leading_zeros = 0;
+    while (bitreader_read_bit(br) == 0 && leading_zeros < 32) {
+        leading_zeros++;
+    }
+
+    if (leading_zeros == 0) {
+        return 0;
+    }
+
+    /* Read the suffix bits */
+    uint32_t suffix = bitreader_read_bits(br, leading_zeros);
+    return (1 << leading_zeros) - 1 + suffix;
+}
+
+int32_t bitreader_read_se(BitReader *br) {
+    uint32_t ue_val = bitreader_read_ue(br);
+
+    /* Decode: odd values are positive, even are negative */
+    if (ue_val & 1) {
+        return (int32_t)((ue_val + 1) / 2);
+    } else {
+        return -(int32_t)(ue_val / 2);
+    }
+}
+
+size_t bitreader_get_bit_position(BitReader *br) {
+    return br->byte_pos * 8 + br->bit_pos;
+}
+
+int bitreader_is_byte_aligned(BitReader *br) {
+    return br->bit_pos == 0;
+}
+
+size_t bitreader_get_remaining_bytes(BitReader *br) {
+    if (br->bit_pos != 0) {
+        /* Not byte-aligned, remaining bytes after current partial byte */
+        return br->size - br->byte_pos - 1;
+    }
+    return br->size - br->byte_pos;
+}
+
+const uint8_t *bitreader_get_pointer(BitReader *br) {
+    return br->buffer + br->byte_pos;
+}

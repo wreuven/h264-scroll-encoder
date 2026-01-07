@@ -137,4 +137,91 @@ size_t h264_write_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg);
 size_t h264_write_non_idr_i_frame_color(NALWriter *nw, H264EncoderConfig *cfg,
                                          uint8_t y, uint8_t cb, uint8_t cr);
 
+/*
+ * Write an IDR I-frame with 3 horizontal color stripes
+ * Useful for verifying scroll behavior (distinguishes scroll from wipe)
+ *
+ * y1/cb1/cr1: Top third color
+ * y2/cb2/cr2: Middle third color
+ * y3/cb3/cr3: Bottom third color
+ */
+size_t h264_write_idr_frame_striped(NALWriter *nw, H264EncoderConfig *cfg,
+                                     uint8_t y1, uint8_t cb1, uint8_t cr1,
+                                     uint8_t y2, uint8_t cb2, uint8_t cr2,
+                                     uint8_t y3, uint8_t cb3, uint8_t cr3);
+
+/*
+ * Write a non-IDR I-frame with 3 horizontal color stripes
+ */
+size_t h264_write_non_idr_i_frame_striped(NALWriter *nw, H264EncoderConfig *cfg,
+                                           uint8_t y1, uint8_t cb1, uint8_t cr1,
+                                           uint8_t y2, uint8_t cb2, uint8_t cr2,
+                                           uint8_t y3, uint8_t cb3, uint8_t cr3);
+
+/*
+ * Write an IDR I-frame from raw YUV420p data
+ *
+ * yuv_data: raw YUV420p frame (Y plane, then U/Cb plane, then V/Cr plane)
+ * Layout: Y[width*height], U[width*height/4], V[width*height/4]
+ */
+size_t h264_write_idr_frame_yuv(NALWriter *nw, H264EncoderConfig *cfg,
+                                 const uint8_t *yuv_data);
+
+/*
+ * Write a non-IDR I-frame from raw YUV420p data
+ */
+size_t h264_write_non_idr_i_frame_yuv(NALWriter *nw, H264EncoderConfig *cfg,
+                                       const uint8_t *yuv_data);
+
+/*
+ * Rewrite x264 IDR frame with our slice header (for long-term ref marking)
+ *
+ * This extracts the compressed MB data from x264's IDR frame and wraps it
+ * with our own slice header that sets long_term_reference_flag=1.
+ *
+ * Parameters:
+ *   nw          - NAL writer for output
+ *   cfg         - Encoder config (must have SPS params set)
+ *   rbsp        - x264's IDR RBSP data (after EBSP-to-RBSP conversion)
+ *   rbsp_size   - Size of RBSP data
+ *
+ * Returns: bytes written, or 0 on error
+ */
+size_t h264_rewrite_idr_frame(NALWriter *nw, H264EncoderConfig *cfg,
+                               const uint8_t *rbsp, size_t rbsp_size);
+
+/*
+ * Rewrite x264 IDR frame as non-IDR I-frame with MMCO commands
+ *
+ * This extracts the compressed MB data from x264's IDR frame and wraps it
+ * with a non-IDR I-frame slice header that uses MMCO to mark as long-term.
+ *
+ * Parameters:
+ *   nw          - NAL writer for output
+ *   cfg         - Encoder config
+ *   rbsp        - x264's IDR RBSP data
+ *   rbsp_size   - Size of RBSP data
+ *   frame_num   - frame_num for this frame
+ *
+ * Returns: bytes written, or 0 on error
+ */
+size_t h264_rewrite_as_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg,
+                                        const uint8_t *rbsp, size_t rbsp_size,
+                                        int frame_num);
+
+/*
+ * Extended rewrite functions that use separate configs for parsing and writing.
+ *
+ * parse_cfg: Config with x264's SPS params (for parsing the input slice header)
+ * write_cfg: Config with our SPS params (for writing the output slice header)
+ */
+size_t h264_rewrite_idr_frame_ex(NALWriter *nw, H264EncoderConfig *write_cfg,
+                                  H264EncoderConfig *parse_cfg,
+                                  const uint8_t *rbsp, size_t rbsp_size);
+
+size_t h264_rewrite_as_non_idr_i_frame_ex(NALWriter *nw, H264EncoderConfig *write_cfg,
+                                           H264EncoderConfig *parse_cfg,
+                                           const uint8_t *rbsp, size_t rbsp_size,
+                                           int frame_num);
+
 #endif /* H264_ENCODER_H */

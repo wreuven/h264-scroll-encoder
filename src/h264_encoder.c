@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdio.h>
 
 void h264_encoder_init(H264EncoderConfig *cfg, int width, int height) {
     memset(cfg, 0, sizeof(*cfg));
@@ -195,8 +196,10 @@ static void h264_write_p_slice_header(BitWriter *bw, H264EncoderConfig *cfg,
     bitwriter_write_ue(bw, 1);
 
     /* ref_pic_list_modification (for P-slices) */
+    /* With only long-term references in DPB, default RefPicList0 is built from
+     * long-term pics in ascending order of long_term_pic_num: [A(ltp=0), B(ltp=1)]
+     * This is exactly what we need, so no modification required. */
     /* ref_pic_list_modification_flag_l0: u(1) = 0 */
-    /* We rely on default ordering - DPB should have A at 0, B at 1 */
     bitwriter_write_bit(bw, 0);
 
     /* dec_ref_pic_marking() - only for reference pictures (nal_ref_idc != 0) */
@@ -258,7 +261,7 @@ static void h264_write_p16x16_mb_qpel(BitWriter *bw, int ref_idx, int mvd_x_qpel
     /* mb_type: ue(0) = P_L0_16x16 */
     bitwriter_write_ue(bw, 0);
 
-    /* ref_idx_l0[0]: te(1) */
+    /* ref_idx_l0[0]: te(v) with range [0,1] - inverted for our reference list ordering */
     bitwriter_write_bit(bw, 1 - (ref_idx & 1));
 
     /* mvd_l0[0][0]: se(mvd_x) - already in quarter-pel */
@@ -298,49 +301,78 @@ typedef struct {
 
 static void get_mv_prediction_ex(int mb_x, int mb_y, int mb_width,
                                   const MVInfo *above_row, const MVInfo *left,
+                                  int cur_ref_idx,
                                   int *pred_mvx, int *pred_mvy) {
     /*
-     * H.264 MV prediction for P16x16:
+     * H.264 MV prediction for P16x16 (spec 8.4.1.3.1):
      * A = left, B = above, C = above-right (or D = above-left if C unavailable)
      *
-     * If only one is available, use it.
-     * Otherwise, use median(A, B, C).
+     * Key rule: If EXACTLY ONE neighbor has matching ref_idx, use that MV directly.
+     * Otherwise, use median with mismatched ref_idx neighbors treated as MV=(0,0).
      */
     MVInfo a = {0}, b = {0}, c = {0};
+    int a_ref_match = 0, b_ref_match = 0, c_ref_match = 0;
 
     /* A: left neighbor */
     if (mb_x > 0 && left->available) {
         a = *left;
         a.available = 1;
+        a_ref_match = (a.ref_idx == cur_ref_idx);
     }
 
     /* B: above neighbor */
     if (mb_y > 0 && above_row[mb_x].available) {
         b = above_row[mb_x];
         b.available = 1;
+        b_ref_match = (b.ref_idx == cur_ref_idx);
     }
 
     /* C: above-right neighbor (not available for rightmost column) */
     if (mb_y > 0 && mb_x + 1 < mb_width && above_row[mb_x + 1].available) {
         c = above_row[mb_x + 1];
         c.available = 1;
+        c_ref_match = (c.ref_idx == cur_ref_idx);
     } else if (mb_y > 0 && mb_x > 0 && above_row[mb_x - 1].available) {
         /* D: above-left as fallback */
         c = above_row[mb_x - 1];
         c.available = 1;
+        c_ref_match = (c.ref_idx == cur_ref_idx);
     }
 
     int num_available = a.available + b.available + c.available;
+    int num_ref_match = a_ref_match + b_ref_match + c_ref_match;
 
     if (num_available == 0) {
         *pred_mvx = 0;
         *pred_mvy = 0;
     } else if (num_available == 1) {
-        if (a.available) { *pred_mvx = a.mv_x; *pred_mvy = a.mv_y; }
-        else if (b.available) { *pred_mvx = b.mv_x; *pred_mvy = b.mv_y; }
-        else { *pred_mvx = c.mv_x; *pred_mvy = c.mv_y; }
+        /* Only one neighbor available - use it (with MV=0 if ref doesn't match) */
+        if (a.available) {
+            *pred_mvx = a_ref_match ? a.mv_x : 0;
+            *pred_mvy = a_ref_match ? a.mv_y : 0;
+        } else if (b.available) {
+            *pred_mvx = b_ref_match ? b.mv_x : 0;
+            *pred_mvy = b_ref_match ? b.mv_y : 0;
+        } else {
+            *pred_mvx = c_ref_match ? c.mv_x : 0;
+            *pred_mvy = c_ref_match ? c.mv_y : 0;
+        }
+    } else if (num_ref_match == 1) {
+        /* EXACTLY one neighbor has matching ref_idx - use that MV directly (spec 8.4.1.3.1) */
+        if (a_ref_match) {
+            *pred_mvx = a.mv_x;
+            *pred_mvy = a.mv_y;
+        } else if (b_ref_match) {
+            *pred_mvx = b.mv_x;
+            *pred_mvy = b.mv_y;
+        } else {
+            *pred_mvx = c.mv_x;
+            *pred_mvy = c.mv_y;
+        }
     } else {
-        /* Median of available MVs (treat unavailable as 0) */
+        /* Multiple available: use median of ACTUAL neighboring MVs (spec 8.4.1.3.1)
+         * Note: MVs from unavailable/intra neighbors are 0, but inter neighbors
+         * with different ref_idx still use their actual MV in median calculation */
         int ax = a.available ? a.mv_x : 0;
         int ay = a.available ? a.mv_y : 0;
         int bx = b.available ? b.mv_x : 0;
@@ -414,7 +446,7 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
             /* Get MV prediction using neighbor information */
             int pred_mvx, pred_mvy;
             get_mv_prediction_ex(mb_x, mb_y, cfg->mb_width, above_row, &left,
-                                 &pred_mvx, &pred_mvy);
+                                 ref_idx, &pred_mvx, &pred_mvy);
 
             /* Calculate MVD */
             int mvd_x = mv_x_qpel - pred_mvx;
@@ -428,7 +460,17 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
              *
              * Skipped MBs inherit ref_idx=0 and predicted MV, with no residual.
              */
-            int can_skip = (ref_idx == 0) && (mvd_x == 0) && (mvd_y == 0);
+            /* P_Skip disabled - decoder MV derivation differs from our prediction.
+             * TODO: Investigate why P_Skip causes artifacts at region boundaries. */
+            int can_skip = 0;
+
+            /* Debug: show first B region MB */
+            if (mb_x == 0 && mb_y == a_region_end && cfg->frame_num >= 2 && cfg->frame_num <= 20) {
+                int ref_pos = mb_y * 16 + mv_y;  /* Where we read from in B */
+                fprintf(stderr, "Frame %d: offset=%d, B_start=%d, mv_y=%d px (%d qpel), pred=(%d,%d), mvd=(%d,%d), reading B@%d\n",
+                        cfg->frame_num, offset_mb, a_region_end, mv_y, mv_y_qpel,
+                        pred_mvx, pred_mvy, mvd_x, mvd_y, ref_pos);
+            }
 
             if (can_skip) {
                 skip_count++;
@@ -660,6 +702,46 @@ size_t h264_write_idr_frame(NALWriter *nw, H264EncoderConfig *cfg) {
 }
 
 /*
+ * Write an IDR I-frame with 3 horizontal color stripes
+ * Colors are for top, middle, bottom thirds of frame
+ */
+size_t h264_write_idr_frame_striped(NALWriter *nw, H264EncoderConfig *cfg,
+                                     uint8_t y1, uint8_t cb1, uint8_t cr1,
+                                     uint8_t y2, uint8_t cb2, uint8_t cr2,
+                                     uint8_t y3, uint8_t cb3, uint8_t cr3) {
+    size_t rbsp_capacity = cfg->mb_width * cfg->mb_height * 400 + 1024;
+    uint8_t *rbsp = malloc(rbsp_capacity);
+    BitWriter bw;
+    bitwriter_init(&bw, rbsp, rbsp_capacity);
+
+    cfg->frame_num = 0;
+    h264_write_idr_slice_header(&bw, cfg);
+
+    int third = cfg->mb_height / 3;
+    for (int mb_y = 0; mb_y < cfg->mb_height; mb_y++) {
+        uint8_t y, cb, cr;
+        if (mb_y < third) {
+            y = y1; cb = cb1; cr = cr1;  /* Top third */
+        } else if (mb_y < 2 * third) {
+            y = y2; cb = cb2; cr = cr2;  /* Middle third */
+        } else {
+            y = y3; cb = cb3; cr = cr3;  /* Bottom third */
+        }
+        for (int mb_x = 0; mb_x < cfg->mb_width; mb_x++) {
+            h264_write_ipcm_mb(&bw, y, cb, cr);
+        }
+    }
+
+    bitwriter_write_trailing_bits(&bw);
+    size_t rbsp_size = bitwriter_get_size(&bw);
+    size_t written = nal_write_unit(nw, NAL_REF_IDC_HIGHEST, NAL_TYPE_IDR,
+                                    rbsp, rbsp_size, 1);
+    free(rbsp);
+    cfg->frame_num = 1;
+    return written;
+}
+
+/*
  * Write a non-IDR I-frame using I_PCM macroblocks
  *
  * y, cb, cr: YCbCr color values for the frame
@@ -698,4 +780,269 @@ size_t h264_write_non_idr_i_frame_color(NALWriter *nw, H264EncoderConfig *cfg,
 /* Backward-compatible wrapper with default lighter gray */
 size_t h264_write_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg) {
     return h264_write_non_idr_i_frame_color(nw, cfg, 200, 128, 128);
+}
+
+/*
+ * Write a non-IDR I-frame with 3 horizontal color stripes
+ */
+size_t h264_write_non_idr_i_frame_striped(NALWriter *nw, H264EncoderConfig *cfg,
+                                           uint8_t y1, uint8_t cb1, uint8_t cr1,
+                                           uint8_t y2, uint8_t cb2, uint8_t cr2,
+                                           uint8_t y3, uint8_t cb3, uint8_t cr3) {
+    size_t rbsp_capacity = cfg->mb_width * cfg->mb_height * 400 + 1024;
+    uint8_t *rbsp = malloc(rbsp_capacity);
+    BitWriter bw;
+    bitwriter_init(&bw, rbsp, rbsp_capacity);
+
+    int frame_num = cfg->frame_num;
+    h264_write_non_idr_i_slice_header(&bw, cfg, frame_num);
+
+    int third = cfg->mb_height / 3;
+    for (int mb_y = 0; mb_y < cfg->mb_height; mb_y++) {
+        uint8_t y, cb, cr;
+        if (mb_y < third) {
+            y = y1; cb = cb1; cr = cr1;
+        } else if (mb_y < 2 * third) {
+            y = y2; cb = cb2; cr = cr2;
+        } else {
+            y = y3; cb = cb3; cr = cr3;
+        }
+        for (int mb_x = 0; mb_x < cfg->mb_width; mb_x++) {
+            h264_write_ipcm_mb(&bw, y, cb, cr);
+        }
+    }
+
+    bitwriter_write_trailing_bits(&bw);
+    size_t rbsp_size = bitwriter_get_size(&bw);
+    size_t written = nal_write_unit(nw, NAL_REF_IDC_HIGHEST, NAL_TYPE_SLICE,
+                                    rbsp, rbsp_size, 1);
+    free(rbsp);
+    cfg->frame_num++;
+    return written;
+}
+
+/*
+ * Parsed slice header info
+ */
+typedef struct {
+    size_t mb_data_start_bit;
+    int32_t slice_qp_delta;
+    uint32_t disable_deblocking_filter_idc;
+    int32_t slice_alpha_c0_offset_div2;
+    int32_t slice_beta_offset_div2;
+} ParsedSliceHeader;
+
+/*
+ * Parse x264's IDR slice header to find where MB data starts.
+ *
+ * Returns: 1 on success, 0 on error
+ */
+static int parse_idr_slice_header(const uint8_t *rbsp, size_t rbsp_size,
+                                   H264EncoderConfig *cfg, ParsedSliceHeader *hdr) {
+    BitReader br;
+    bitreader_init(&br, rbsp, rbsp_size);
+
+    memset(hdr, 0, sizeof(*hdr));
+
+    /* first_mb_in_slice: ue(v) */
+    uint32_t first_mb = bitreader_read_ue(&br);
+    (void)first_mb;  /* Should be 0 */
+
+    /* slice_type: ue(v) */
+    uint32_t slice_type = bitreader_read_ue(&br);
+    (void)slice_type;  /* Should be 2 or 7 for I-slice */
+
+    /* pic_parameter_set_id: ue(v) */
+    uint32_t pps_id = bitreader_read_ue(&br);
+    (void)pps_id;
+
+    /* frame_num: u(log2_max_frame_num) */
+    bitreader_read_bits(&br, cfg->log2_max_frame_num);
+
+    /* For IDR: idr_pic_id: ue(v) */
+    bitreader_read_ue(&br);
+
+    /* POC syntax depends on pic_order_cnt_type */
+    if (cfg->pic_order_cnt_type == 0) {
+        /* pic_order_cnt_lsb: u(log2_max_pic_order_cnt_lsb) */
+        bitreader_read_bits(&br, cfg->log2_max_pic_order_cnt_lsb);
+    }
+    /* poc_type 2: no extra syntax */
+
+    /* dec_ref_pic_marking() for IDR */
+    /* no_output_of_prior_pics_flag: u(1) */
+    bitreader_read_bit(&br);
+    /* long_term_reference_flag: u(1) */
+    bitreader_read_bit(&br);
+
+    /* slice_qp_delta: se(v) - PRESERVE THIS */
+    hdr->slice_qp_delta = bitreader_read_se(&br);
+
+    /* Deblocking filter syntax if present */
+    if (cfg->deblocking_filter_control_present_flag) {
+        hdr->disable_deblocking_filter_idc = bitreader_read_ue(&br);
+        if (hdr->disable_deblocking_filter_idc != 1) {
+            hdr->slice_alpha_c0_offset_div2 = bitreader_read_se(&br);
+            hdr->slice_beta_offset_div2 = bitreader_read_se(&br);
+        }
+    }
+
+    hdr->mb_data_start_bit = bitreader_get_bit_position(&br);
+    return 1;
+}
+
+/*
+ * Copy bits from source to destination, handling bit alignment
+ */
+static void copy_bits(BitWriter *bw, const uint8_t *src, size_t src_size,
+                       size_t start_bit, size_t num_bits) {
+    BitReader br;
+    bitreader_init(&br, src, src_size);
+
+    /* Skip to start position */
+    for (size_t i = 0; i < start_bit; i++) {
+        bitreader_read_bit(&br);
+    }
+
+    /* Copy bits */
+    for (size_t i = 0; i < num_bits; i++) {
+        bitwriter_write_bit(bw, bitreader_read_bit(&br));
+    }
+}
+
+/*
+ * Extended rewrite: uses parse_cfg for parsing x264's header, write_cfg for output
+ */
+size_t h264_rewrite_idr_frame_ex(NALWriter *nw, H264EncoderConfig *write_cfg,
+                                  H264EncoderConfig *parse_cfg,
+                                  const uint8_t *rbsp, size_t rbsp_size) {
+    /* Parse x264's slice header */
+    ParsedSliceHeader hdr;
+    if (!parse_idr_slice_header(rbsp, rbsp_size, parse_cfg, &hdr)) {
+        return 0;
+    }
+
+    size_t total_bits = rbsp_size * 8;
+    size_t mb_data_bits = total_bits - hdr.mb_data_start_bit;
+
+    size_t out_capacity = rbsp_size + 256;
+    uint8_t *out_rbsp = malloc(out_capacity);
+    BitWriter bw;
+    bitwriter_init(&bw, out_rbsp, out_capacity);
+
+    /* Write our IDR slice header using write_cfg params */
+    bitwriter_write_ue(&bw, 0);  /* first_mb_in_slice */
+    bitwriter_write_ue(&bw, SLICE_TYPE_I_ALL);  /* slice_type */
+    bitwriter_write_ue(&bw, 0);  /* pps_id */
+    bitwriter_write_bits(&bw, 0, write_cfg->log2_max_frame_num);  /* frame_num */
+    bitwriter_write_ue(&bw, write_cfg->idr_pic_id);  /* idr_pic_id */
+
+    if (write_cfg->pic_order_cnt_type == 0) {
+        bitwriter_write_bits(&bw, 0, write_cfg->log2_max_pic_order_cnt_lsb);
+    }
+
+    /* dec_ref_pic_marking: long_term_reference_flag = 1 */
+    bitwriter_write_bit(&bw, 0);  /* no_output_of_prior_pics_flag */
+    bitwriter_write_bit(&bw, 1);  /* long_term_reference_flag = 1 */
+
+    /* PRESERVE x264's slice_qp_delta */
+    bitwriter_write_se(&bw, hdr.slice_qp_delta);
+
+    /* PRESERVE x264's deblocking filter settings */
+    if (write_cfg->deblocking_filter_control_present_flag) {
+        bitwriter_write_ue(&bw, hdr.disable_deblocking_filter_idc);
+        if (hdr.disable_deblocking_filter_idc != 1) {
+            bitwriter_write_se(&bw, hdr.slice_alpha_c0_offset_div2);
+            bitwriter_write_se(&bw, hdr.slice_beta_offset_div2);
+        }
+    }
+
+    /* Copy x264's MB data */
+    copy_bits(&bw, rbsp, rbsp_size, hdr.mb_data_start_bit, mb_data_bits);
+
+    size_t out_size = bitwriter_get_size(&bw);
+    size_t written = nal_write_unit(nw, NAL_REF_IDC_HIGHEST, NAL_TYPE_IDR,
+                                    out_rbsp, out_size, 1);
+
+    free(out_rbsp);
+    write_cfg->frame_num = 1;
+    return written;
+}
+
+size_t h264_rewrite_as_non_idr_i_frame_ex(NALWriter *nw, H264EncoderConfig *write_cfg,
+                                           H264EncoderConfig *parse_cfg,
+                                           const uint8_t *rbsp, size_t rbsp_size,
+                                           int frame_num) {
+    /* Parse x264's slice header */
+    ParsedSliceHeader hdr;
+    if (!parse_idr_slice_header(rbsp, rbsp_size, parse_cfg, &hdr)) {
+        return 0;
+    }
+
+    size_t total_bits = rbsp_size * 8;
+    size_t mb_data_bits = total_bits - hdr.mb_data_start_bit;
+
+    size_t out_capacity = rbsp_size + 256;
+    uint8_t *out_rbsp = malloc(out_capacity);
+    BitWriter bw;
+    bitwriter_init(&bw, out_rbsp, out_capacity);
+
+    /* Write non-IDR I-slice header using write_cfg params */
+    bitwriter_write_ue(&bw, 0);  /* first_mb_in_slice */
+    bitwriter_write_ue(&bw, SLICE_TYPE_I_ALL);  /* slice_type */
+    bitwriter_write_ue(&bw, 0);  /* pps_id */
+    bitwriter_write_bits(&bw, frame_num, write_cfg->log2_max_frame_num);  /* frame_num */
+    /* NO idr_pic_id for non-IDR */
+
+    if (write_cfg->pic_order_cnt_type == 0) {
+        bitwriter_write_bits(&bw, frame_num * 2, write_cfg->log2_max_pic_order_cnt_lsb);
+    }
+
+    /* dec_ref_pic_marking with MMCO commands */
+    bitwriter_write_bit(&bw, 1);  /* adaptive_ref_pic_marking_mode_flag */
+    bitwriter_write_ue(&bw, 4);   /* MMCO 4 */
+    bitwriter_write_ue(&bw, 2);   /* max_long_term_frame_idx_plus1 = 2 */
+    bitwriter_write_ue(&bw, 6);   /* MMCO 6 */
+    bitwriter_write_ue(&bw, 1);   /* long_term_frame_idx = 1 */
+    bitwriter_write_ue(&bw, 0);   /* MMCO 0 (end) */
+
+    /* PRESERVE x264's slice_qp_delta */
+    bitwriter_write_se(&bw, hdr.slice_qp_delta);
+
+    /* PRESERVE x264's deblocking filter settings */
+    if (write_cfg->deblocking_filter_control_present_flag) {
+        bitwriter_write_ue(&bw, hdr.disable_deblocking_filter_idc);
+        if (hdr.disable_deblocking_filter_idc != 1) {
+            bitwriter_write_se(&bw, hdr.slice_alpha_c0_offset_div2);
+            bitwriter_write_se(&bw, hdr.slice_beta_offset_div2);
+        }
+    }
+
+    /* Copy x264's MB data */
+    copy_bits(&bw, rbsp, rbsp_size, hdr.mb_data_start_bit, mb_data_bits);
+
+    size_t out_size = bitwriter_get_size(&bw);
+    size_t written = nal_write_unit(nw, NAL_REF_IDC_HIGHEST, NAL_TYPE_SLICE,
+                                    out_rbsp, out_size, 1);
+
+    free(out_rbsp);
+    write_cfg->frame_num = frame_num + 1;
+    return written;
+}
+
+/*
+ * Rewrite x264 IDR frame with our slice header (uses same cfg for parse and write)
+ */
+size_t h264_rewrite_idr_frame(NALWriter *nw, H264EncoderConfig *cfg,
+                               const uint8_t *rbsp, size_t rbsp_size) {
+    return h264_rewrite_idr_frame_ex(nw, cfg, cfg, rbsp, rbsp_size);
+}
+
+/*
+ * Rewrite x264 IDR as non-IDR I-frame with MMCO commands (uses same cfg)
+ */
+size_t h264_rewrite_as_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg,
+                                        const uint8_t *rbsp, size_t rbsp_size,
+                                        int frame_num) {
+    return h264_rewrite_as_non_idr_i_frame_ex(nw, cfg, cfg, rbsp, rbsp_size, frame_num);
 }

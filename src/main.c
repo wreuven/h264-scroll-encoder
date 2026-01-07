@@ -51,10 +51,12 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -w, --width W        Frame width (if not using input file)\n");
     fprintf(stderr, "  -h, --height H       Frame height (if not using input file)\n");
     fprintf(stderr, "  -t, --test           Generate test stream (no input file needed)\n");
+    fprintf(stderr, "  -s, --striped        Use striped test frames (red/green/blue, yellow/cyan/magenta)\n");
     fprintf(stderr, "  --color-a COLOR      Color for frame A (default: gray)\n");
     fprintf(stderr, "  --color-b COLOR      Color for frame B (default: gray)\n");
     fprintf(stderr, "  --help               Show this help\n");
     fprintf(stderr, "\nColors: red, blue, green, yellow, cyan, magenta, white, black, gray\n");
+    fprintf(stderr, "\nStriped mode helps verify scroll vs wipe: stripes should move smoothly.\n");
 }
 
 /*
@@ -121,6 +123,7 @@ int main(int argc, char *argv[]) {
     int num_frames = 60;
     int width = 0, height = 0;
     int test_mode = 0;
+    int striped_mode = 0;
     const char *color_a_name = "gray";
     const char *color_b_name = "gray";
 
@@ -131,6 +134,7 @@ int main(int argc, char *argv[]) {
         {"width", required_argument, 0, 'w'},
         {"height", required_argument, 0, 'H'},
         {"test", no_argument, 0, 't'},
+        {"striped", no_argument, 0, 's'},
         {"color-a", required_argument, 0, 'A'},
         {"color-b", required_argument, 0, 'B'},
         {"help", no_argument, 0, '?'},
@@ -138,7 +142,7 @@ int main(int argc, char *argv[]) {
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "i:o:n:w:H:t", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:o:n:w:H:ts", long_options, NULL)) != -1) {
         switch (c) {
             case 'i': input_file = optarg; break;
             case 'o': output_file = optarg; break;
@@ -146,6 +150,7 @@ int main(int argc, char *argv[]) {
             case 'w': width = atoi(optarg); break;
             case 'H': height = atoi(optarg); break;
             case 't': test_mode = 1; break;
+            case 's': striped_mode = 1; test_mode = 1; break;
             case 'A': color_a_name = optarg; break;
             case 'B': color_b_name = optarg; break;
             case '?':
@@ -193,11 +198,14 @@ int main(int argc, char *argv[]) {
 
         h264_encoder_init(&cfg, width, height);
 
-        printf("Test mode: %dx%d, %d frames\n", width, height, num_frames);
-        printf("  Color A: %s (Y=%d, Cb=%d, Cr=%d)\n",
-               color_a_name, color_a_y, color_a_cb, color_a_cr);
-        printf("  Color B: %s (Y=%d, Cb=%d, Cr=%d)\n",
-               color_b_name, color_b_y, color_b_cb, color_b_cr);
+        printf("Test mode: %dx%d, %d frames%s\n", width, height, num_frames,
+               striped_mode ? " (striped)" : "");
+        if (!striped_mode) {
+            printf("  Color A: %s (Y=%d, Cb=%d, Cr=%d)\n",
+                   color_a_name, color_a_y, color_a_cb, color_a_cr);
+            printf("  Color B: %s (Y=%d, Cb=%d, Cr=%d)\n",
+                   color_b_name, color_b_y, color_b_cb, color_b_cr);
+        }
 
         /* Generate and write SPS */
         uint8_t sps[256];
@@ -211,13 +219,33 @@ int main(int argc, char *argv[]) {
         nal_write_unit(&nw, NAL_REF_IDC_HIGHEST, NAL_TYPE_PPS, pps, pps_size, 1);
         printf("  PPS: %zu bytes\n", pps_size);
 
-        /* Generate reference frame A (IDR) with color */
-        printf("  Generating IDR frame A (%s)...\n", color_a_name);
-        h264_write_idr_frame_color(&nw, &cfg, color_a_y, color_a_cb, color_a_cr);
+        if (striped_mode) {
+            /* Striped mode: Frame A = Red/Green/Blue, Frame B = Yellow/Cyan/Magenta
+             * This allows us to verify true scrolling vs. wipe effect:
+             * - At 1/3 scroll: Top should show A's middle (green), bottom shows B's top (yellow)
+             * - If scrolling works, green stripe moves up from middle to top
+             * - If just a wipe, we'd see hard cuts between solid colors
+             */
+            printf("  Generating striped IDR frame A (Red/Green/Blue)...\n");
+            h264_write_idr_frame_striped(&nw, &cfg,
+                                         81, 90, 240,    /* Red top */
+                                         145, 54, 34,    /* Green middle */
+                                         41, 240, 110);  /* Blue bottom */
 
-        /* Generate reference frame B (non-IDR I-frame) with color */
-        printf("  Generating non-IDR I-frame B (%s)...\n", color_b_name);
-        h264_write_non_idr_i_frame_color(&nw, &cfg, color_b_y, color_b_cb, color_b_cr);
+            printf("  Generating striped non-IDR I-frame B (Yellow/Cyan/Magenta)...\n");
+            h264_write_non_idr_i_frame_striped(&nw, &cfg,
+                                               210, 16, 146,   /* Yellow top */
+                                               170, 166, 16,   /* Cyan middle */
+                                               106, 202, 222); /* Magenta bottom */
+        } else {
+            /* Generate reference frame A (IDR) with solid color */
+            printf("  Generating IDR frame A (%s)...\n", color_a_name);
+            h264_write_idr_frame_color(&nw, &cfg, color_a_y, color_a_cb, color_a_cr);
+
+            /* Generate reference frame B (non-IDR I-frame) with solid color */
+            printf("  Generating non-IDR I-frame B (%s)...\n", color_b_name);
+            h264_write_non_idr_i_frame_color(&nw, &cfg, color_b_y, color_b_cb, color_b_cr);
+        }
 
         printf("  Setup complete: frame_num=%d\n", cfg.frame_num);
 
@@ -238,22 +266,15 @@ int main(int argc, char *argv[]) {
         NALUnit unit;
         int found_sps = 0, found_pps = 0;
         int idr_count = 0;
-        size_t nal_positions[16];
-        size_t nal_sizes[16];
-        int nal_count = 0;
 
-        /* First pass: find all NAL units */
-        while (nal_parser_next(&parser, &unit) && nal_count < 16) {
-            size_t nal_start = (unit.data - 1) - input;  /* Include header byte */
+        /* Store IDR frame RBSP data for rewriting */
+        uint8_t *idr_rbsp[2] = {NULL, NULL};
+        size_t idr_rbsp_size[2] = {0, 0};
 
-            /* Find the start code before this NAL */
-            size_t sc_start = nal_start;
-            while (sc_start > 0 && input[sc_start - 1] == 0) sc_start--;
-
-            nal_positions[nal_count] = sc_start;
-
-            printf("NAL %d: type=%d, ref_idc=%d, pos=%zu\n",
-                   nal_count, unit.nal_unit_type, unit.nal_ref_idc, sc_start);
+        /* First pass: find SPS, PPS, and IDR frames */
+        while (nal_parser_next(&parser, &unit)) {
+            printf("NAL: type=%d, ref_idc=%d, size=%zu\n",
+                   unit.nal_unit_type, unit.nal_ref_idc, unit.size);
 
             if (unit.nal_unit_type == NAL_TYPE_SPS) {
                 found_sps = 1;
@@ -265,7 +286,10 @@ int main(int argc, char *argv[]) {
                     width = w;
                     height = h;
                     h264_encoder_init(&cfg, width, height);
-                    h264_encoder_set_sps(&cfg, rbsp, rbsp_size, log2_mfn, poc_type, log2_poc);
+                    /* Store x264's SPS params for slice header parsing */
+                    cfg.log2_max_frame_num = log2_mfn;
+                    cfg.pic_order_cnt_type = poc_type;
+                    cfg.log2_max_pic_order_cnt_lsb = log2_poc;
                     printf("SPS: %dx%d, log2_max_frame_num=%d, poc_type=%d\n",
                            width, height, log2_mfn, poc_type);
                 }
@@ -275,21 +299,17 @@ int main(int argc, char *argv[]) {
                 size_t rbsp_size = ebsp_to_rbsp(rbsp, unit.data, unit.size);
                 int num_ref_l0, deblock_ctrl;
                 if (parse_pps(rbsp, rbsp_size, &num_ref_l0, &deblock_ctrl) == 0) {
-                    h264_encoder_set_pps(&cfg, rbsp, rbsp_size, num_ref_l0, deblock_ctrl);
+                    cfg.deblocking_filter_control_present_flag = deblock_ctrl;
                     printf("PPS: num_ref_l0=%d, deblock_ctrl=%d\n", num_ref_l0, deblock_ctrl);
                 }
-            } else if (unit.nal_unit_type == NAL_TYPE_IDR) {
+            } else if (unit.nal_unit_type == NAL_TYPE_IDR && idr_count < 2) {
+                /* Convert EBSP to RBSP and store */
+                idr_rbsp[idr_count] = malloc(unit.size);
+                idr_rbsp_size[idr_count] = ebsp_to_rbsp(idr_rbsp[idr_count], unit.data, unit.size);
+                printf("IDR %d: RBSP size = %zu bytes\n", idr_count, idr_rbsp_size[idr_count]);
                 idr_count++;
             }
-
-            nal_count++;
         }
-
-        /* Set sizes based on next NAL position */
-        for (int i = 0; i < nal_count - 1; i++) {
-            nal_sizes[i] = nal_positions[i + 1] - nal_positions[i];
-        }
-        nal_sizes[nal_count - 1] = input_size - nal_positions[nal_count - 1];
 
         if (!found_sps || !found_pps) {
             fprintf(stderr, "Error: Input must contain SPS and PPS\n");
@@ -297,35 +317,64 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
+        if (idr_count < 2) {
+            fprintf(stderr, "Error: Input must contain 2 IDR frames (found %d)\n", idr_count);
+            free(input);
+            return 1;
+        }
+
         printf("Found SPS, PPS, %d IDR frames\n", idr_count);
 
-        /* Write our own SPS with larger max_frame_num to avoid wrap-around issues */
+        /* Store x264's SPS params for parsing the slice headers */
+        int x264_log2_max_frame_num = cfg.log2_max_frame_num;
+        int x264_poc_type = cfg.pic_order_cnt_type;
+        int x264_log2_max_poc_lsb = cfg.log2_max_pic_order_cnt_lsb;
+        int x264_deblock_flag = cfg.deblocking_filter_control_present_flag;
+
+        /* Write our own SPS with larger max_frame_num */
         uint8_t our_sps[256];
         size_t our_sps_size = h264_generate_sps(our_sps, sizeof(our_sps), width, height);
         nal_write_unit(&nw, NAL_REF_IDC_HIGH, NAL_TYPE_SPS, our_sps, our_sps_size, 1);
+        printf("  Wrote our SPS: %zu bytes\n", our_sps_size);
 
-        /* Copy PPS and I-frames from input, skip x264's SPS */
-        for (int i = 0; i < nal_count; i++) {
-            uint8_t *nal_start = input + nal_positions[i];
-            size_t nal_size = nal_sizes[i];
-            /* Find NAL type after start code */
-            int offset = (nal_start[2] == 1) ? 3 : 4;
-            uint8_t nal_type = nal_start[offset] & 0x1f;
+        /* Write our own PPS */
+        uint8_t our_pps[256];
+        size_t our_pps_size = h264_generate_pps(our_pps, sizeof(our_pps));
+        nal_write_unit(&nw, NAL_REF_IDC_HIGH, NAL_TYPE_PPS, our_pps, our_pps_size, 1);
+        printf("  Wrote our PPS: %zu bytes\n", our_pps_size);
 
-            /* Skip SPS (we wrote our own), copy everything else */
-            if (nal_type != NAL_TYPE_SPS) {
-                memcpy(output + nw.output_pos, nal_start, nal_size);
-                nw.output_pos += nal_size;
-            }
-        }
+        /* Create a config with x264's params for parsing */
+        H264EncoderConfig x264_cfg = cfg;
+        x264_cfg.log2_max_frame_num = x264_log2_max_frame_num;
+        x264_cfg.pic_order_cnt_type = x264_poc_type;
+        x264_cfg.log2_max_pic_order_cnt_lsb = x264_log2_max_poc_lsb;
+        x264_cfg.deblocking_filter_control_present_flag = x264_deblock_flag;
 
-        /* Use our larger log2_max_frame_num */
-        cfg.log2_max_frame_num = 9;
+        /* Set our cfg to use our SPS params for writing */
+        cfg.log2_max_frame_num = 9;  /* Our SPS uses log2_max_frame_num = 9 */
+        cfg.pic_order_cnt_type = 2;  /* Our SPS uses poc_type = 2 */
+        cfg.deblocking_filter_control_present_flag = 1;  /* Our PPS has this set */
 
-        /* Set frame_num to 2 since we have 2 reference frames from input */
-        cfg.frame_num = 2;
+        /* Rewrite first IDR with long-term reference marking */
+        printf("  Rewriting IDR A with long_term_reference_flag=1...\n");
+        printf("    Parsing with x264 params: log2_mfn=%d, poc_type=%d\n",
+               x264_log2_max_frame_num, x264_poc_type);
+        size_t idr_a_written = h264_rewrite_idr_frame_ex(&nw, &cfg, &x264_cfg,
+                                                          idr_rbsp[0], idr_rbsp_size[0]);
+        printf("  IDR A: %zu bytes written\n", idr_a_written);
 
+        /* Rewrite second IDR as non-IDR I-frame with MMCO commands */
+        printf("  Rewriting IDR B as non-IDR I-frame with MMCO...\n");
+        size_t idr_b_written = h264_rewrite_as_non_idr_i_frame_ex(&nw, &cfg, &x264_cfg,
+                                                                   idr_rbsp[1], idr_rbsp_size[1], 1);
+        printf("  I-frame B: %zu bytes written\n", idr_b_written);
+
+        /* Clean up */
+        free(idr_rbsp[0]);
+        free(idr_rbsp[1]);
         free(input);
+
+        printf("  Setup complete: frame_num=%d\n", cfg.frame_num);
     }
 
     printf("Generating %d scroll frames...\n", num_frames);
