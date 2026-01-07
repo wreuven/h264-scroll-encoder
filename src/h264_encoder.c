@@ -59,11 +59,11 @@ size_t h264_generate_sps(uint8_t *rbsp, size_t capacity, int width, int height) 
     bitwriter_write_bits(&bw, 66, 8);
 
     /* constraint_set0_flag through constraint_set5_flag + reserved */
-    /* Set constraint_set0_flag = 1 (Baseline compatible) */
-    bitwriter_write_bits(&bw, 0x80, 8);
+    /* Match x264: constraint_set0=1, constraint_set1=1 */
+    bitwriter_write_bits(&bw, 0xc0, 8);
 
-    /* level_idc: 40 = Level 4.0 */
-    bitwriter_write_bits(&bw, 40, 8);
+    /* level_idc: 31 = Level 3.1 (match x264) */
+    bitwriter_write_bits(&bw, 31, 8);
 
     /* seq_parameter_set_id: ue(0) */
     bitwriter_write_ue(&bw, 0);
@@ -350,14 +350,14 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
             int mv_x = 0;  /* No horizontal scroll */
 
             if (mb_y < a_region_end) {
-                /* A region: reference A (IDR, older in DPB = ref_idx 1) */
+                /* A region: reference A (long-term ref with LongTermPicNum=0 = ref_idx 0) */
                 /* Fetch from row (mb_y + offset_mb) */
-                ref_idx = 1;
+                ref_idx = 0;
                 mv_y = offset_mb * 16;  /* Convert MB offset to pixels */
             } else {
-                /* B region: reference B (non-IDR I-frame, most recent = ref_idx 0) */
+                /* B region: reference B (long-term ref with LongTermPicNum=1 = ref_idx 1) */
                 /* Fetch from row (mb_y - a_region_end) */
-                ref_idx = 0;
+                ref_idx = 1;
                 mv_y = (offset_mb - cfg->mb_height) * 16;  /* Negative offset in pixels */
             }
 
@@ -421,8 +421,10 @@ static void h264_write_idr_slice_header(BitWriter *bw, H264EncoderConfig *cfg) {
     /* dec_ref_pic_marking() for IDR */
     /* no_output_of_prior_pics_flag: u(1) = 0 */
     bitwriter_write_bit(bw, 0);
-    /* long_term_reference_flag: u(1) = 0 (use short-term ref) */
-    bitwriter_write_bit(bw, 0);
+    /* long_term_reference_flag: u(1) = 1 (use long-term ref)
+     * This marks the IDR as long-term with long_term_frame_idx=0
+     * and sets max_long_term_frame_idx=0 */
+    bitwriter_write_bit(bw, 1);
 
     /* slice_qp_delta: se(0) */
     bitwriter_write_se(bw, 0);
@@ -458,9 +460,24 @@ static void h264_write_non_idr_i_slice_header(BitWriter *bw, H264EncoderConfig *
         bitwriter_write_bits(bw, frame_num * 2, poc_bits);
     }
 
-    /* dec_ref_pic_marking() for non-IDR */
-    /* adaptive_ref_pic_marking_mode_flag: u(1) = 0 (sliding window) */
-    bitwriter_write_bit(bw, 0);
+    /* dec_ref_pic_marking() for non-IDR reference picture
+     * Use adaptive mode with MMCO commands to:
+     * 1. Increase max_long_term_frame_idx to 1 (MMCO 4)
+     * 2. Mark current picture as long-term with idx=1 (MMCO 6)
+     */
+    /* adaptive_ref_pic_marking_mode_flag: u(1) = 1 */
+    bitwriter_write_bit(bw, 1);
+
+    /* MMCO 4: max_long_term_frame_idx_plus1 = 2 (allows indices 0 and 1) */
+    bitwriter_write_ue(bw, 4);  /* memory_management_control_operation */
+    bitwriter_write_ue(bw, 2);  /* max_long_term_frame_idx_plus1 */
+
+    /* MMCO 6: mark current picture as long-term with long_term_frame_idx=1 */
+    bitwriter_write_ue(bw, 6);  /* memory_management_control_operation */
+    bitwriter_write_ue(bw, 1);  /* long_term_frame_idx */
+
+    /* MMCO 0: end of MMCO commands */
+    bitwriter_write_ue(bw, 0);
 
     /* slice_qp_delta: se(0) */
     bitwriter_write_se(bw, 0);
@@ -478,8 +495,14 @@ static void h264_write_non_idr_i_slice_header(BitWriter *bw, H264EncoderConfig *
  * mb_type = 25 for I-slice (I_PCM)
  * This bypasses all prediction, which is useful for debugging.
  * Writes raw samples: 256 luma Y + 64 Cb + 64 Cr = 384 bytes
+ *
+ * YUV values for common colors (BT.601):
+ *   Red:   Y=81,  Cb=90,  Cr=240
+ *   Blue:  Y=41,  Cb=240, Cr=110
+ *   Green: Y=145, Cb=54,  Cr=34
+ *   Gray:  Y=128, Cb=128, Cr=128
  */
-static void h264_write_ipcm_mb(BitWriter *bw, uint8_t luma_val, uint8_t chroma_val) {
+static void h264_write_ipcm_mb(BitWriter *bw, uint8_t y_val, uint8_t cb_val, uint8_t cr_val) {
     /* mb_type: ue(25) for I_PCM in I-slice */
     bitwriter_write_ue(bw, 25);
 
@@ -490,25 +513,30 @@ static void h264_write_ipcm_mb(BitWriter *bw, uint8_t luma_val, uint8_t chroma_v
 
     /* Write 256 luma samples (16x16) */
     for (int i = 0; i < 256; i++) {
-        bitwriter_write_bits(bw, luma_val, 8);
+        bitwriter_write_bits(bw, y_val, 8);
     }
 
     /* Write 64 Cb samples (8x8 for 4:2:0) */
     for (int i = 0; i < 64; i++) {
-        bitwriter_write_bits(bw, chroma_val, 8);
+        bitwriter_write_bits(bw, cb_val, 8);
     }
 
     /* Write 64 Cr samples (8x8 for 4:2:0) */
     for (int i = 0; i < 64; i++) {
-        bitwriter_write_bits(bw, chroma_val, 8);
+        bitwriter_write_bits(bw, cr_val, 8);
     }
 }
 
 /*
  * Write an IDR I-frame using I_PCM macroblocks
- * luma_val = 128 for gray, chroma_val = 128 for neutral
+ *
+ * y, cb, cr: YCbCr color values for the frame
+ *   Default gray: y=128, cb=128, cr=128
+ *   Red (BT.601): y=81, cb=90, cr=240
+ *   Blue:         y=41, cb=240, cr=110
  */
-size_t h264_write_idr_frame(NALWriter *nw, H264EncoderConfig *cfg) {
+size_t h264_write_idr_frame_color(NALWriter *nw, H264EncoderConfig *cfg,
+                                   uint8_t y, uint8_t cb, uint8_t cr) {
     /* I_PCM needs 384 bytes per MB + header overhead */
     size_t rbsp_capacity = cfg->mb_width * cfg->mb_height * 400 + 1024;
     uint8_t *rbsp = malloc(rbsp_capacity);
@@ -521,10 +549,10 @@ size_t h264_write_idr_frame(NALWriter *nw, H264EncoderConfig *cfg) {
     /* Write slice header */
     h264_write_idr_slice_header(&bw, cfg);
 
-    /* Write all macroblocks using I_PCM (gray for frame A) */
+    /* Write all macroblocks using I_PCM */
     int total_mbs = cfg->mb_width * cfg->mb_height;
     for (int i = 0; i < total_mbs; i++) {
-        h264_write_ipcm_mb(&bw, 128, 128);  /* Mid-gray */
+        h264_write_ipcm_mb(&bw, y, cb, cr);
     }
 
     bitwriter_write_trailing_bits(&bw);
@@ -539,10 +567,18 @@ size_t h264_write_idr_frame(NALWriter *nw, H264EncoderConfig *cfg) {
     return written;
 }
 
+/* Backward-compatible wrapper with default gray */
+size_t h264_write_idr_frame(NALWriter *nw, H264EncoderConfig *cfg) {
+    return h264_write_idr_frame_color(nw, cfg, 128, 128, 128);
+}
+
 /*
  * Write a non-IDR I-frame using I_PCM macroblocks
+ *
+ * y, cb, cr: YCbCr color values for the frame
  */
-size_t h264_write_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg) {
+size_t h264_write_non_idr_i_frame_color(NALWriter *nw, H264EncoderConfig *cfg,
+                                         uint8_t y, uint8_t cb, uint8_t cr) {
     /* I_PCM needs 384 bytes per MB + header overhead */
     size_t rbsp_capacity = cfg->mb_width * cfg->mb_height * 400 + 1024;
     uint8_t *rbsp = malloc(rbsp_capacity);
@@ -554,10 +590,10 @@ size_t h264_write_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg) {
     /* Write slice header */
     h264_write_non_idr_i_slice_header(&bw, cfg, frame_num);
 
-    /* Write all macroblocks using I_PCM (different gray for frame B) */
+    /* Write all macroblocks using I_PCM */
     int total_mbs = cfg->mb_width * cfg->mb_height;
     for (int i = 0; i < total_mbs; i++) {
-        h264_write_ipcm_mb(&bw, 200, 128);  /* Lighter gray to distinguish from A */
+        h264_write_ipcm_mb(&bw, y, cb, cr);
     }
 
     bitwriter_write_trailing_bits(&bw);
@@ -570,4 +606,9 @@ size_t h264_write_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg) {
     free(rbsp);
     cfg->frame_num++;
     return written;
+}
+
+/* Backward-compatible wrapper with default lighter gray */
+size_t h264_write_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg) {
+    return h264_write_non_idr_i_frame_color(nw, cfg, 200, 128, 128);
 }

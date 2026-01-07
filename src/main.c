@@ -10,6 +10,37 @@
 #define MAX_STREAM_SIZE (64 * 1024 * 1024)  /* 64 MB max output */
 #define MAX_INPUT_SIZE  (16 * 1024 * 1024)  /* 16 MB max input */
 
+/* YCbCr color values (BT.601) */
+typedef struct {
+    const char *name;
+    uint8_t y, cb, cr;
+} ColorEntry;
+
+static const ColorEntry color_table[] = {
+    {"red",    81,  90, 240},
+    {"blue",   41, 240, 110},
+    {"green", 145,  54,  34},
+    {"yellow",210,  16, 146},
+    {"cyan",  170, 166,  16},
+    {"magenta",106,202, 222},
+    {"white", 235, 128, 128},
+    {"black",  16, 128, 128},
+    {"gray",  128, 128, 128},
+    {NULL, 0, 0, 0}
+};
+
+static int parse_color(const char *name, uint8_t *y, uint8_t *cb, uint8_t *cr) {
+    for (const ColorEntry *c = color_table; c->name; c++) {
+        if (strcasecmp(name, c->name) == 0) {
+            *y = c->y;
+            *cb = c->cb;
+            *cr = c->cr;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static void print_usage(const char *prog) {
     fprintf(stderr, "H.264 Scroll Encoder - Generate scrolling animation from two reference frames\n\n");
     fprintf(stderr, "Usage: %s [options]\n\n", prog);
@@ -20,7 +51,10 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -w, --width W        Frame width (if not using input file)\n");
     fprintf(stderr, "  -h, --height H       Frame height (if not using input file)\n");
     fprintf(stderr, "  -t, --test           Generate test stream (no input file needed)\n");
+    fprintf(stderr, "  --color-a COLOR      Color for frame A (default: gray)\n");
+    fprintf(stderr, "  --color-b COLOR      Color for frame B (default: gray)\n");
     fprintf(stderr, "  --help               Show this help\n");
+    fprintf(stderr, "\nColors: red, blue, green, yellow, cyan, magenta, white, black, gray\n");
 }
 
 /*
@@ -87,6 +121,8 @@ int main(int argc, char *argv[]) {
     int num_frames = 60;
     int width = 0, height = 0;
     int test_mode = 0;
+    const char *color_a_name = "gray";
+    const char *color_b_name = "gray";
 
     static struct option long_options[] = {
         {"input", required_argument, 0, 'i'},
@@ -95,6 +131,8 @@ int main(int argc, char *argv[]) {
         {"width", required_argument, 0, 'w'},
         {"height", required_argument, 0, 'H'},
         {"test", no_argument, 0, 't'},
+        {"color-a", required_argument, 0, 'A'},
+        {"color-b", required_argument, 0, 'B'},
         {"help", no_argument, 0, '?'},
         {0, 0, 0, 0}
     };
@@ -108,11 +146,25 @@ int main(int argc, char *argv[]) {
             case 'w': width = atoi(optarg); break;
             case 'H': height = atoi(optarg); break;
             case 't': test_mode = 1; break;
+            case 'A': color_a_name = optarg; break;
+            case 'B': color_b_name = optarg; break;
             case '?':
             default:
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    /* Parse color names to YCbCr */
+    uint8_t color_a_y, color_a_cb, color_a_cr;
+    uint8_t color_b_y, color_b_cb, color_b_cr;
+    if (parse_color(color_a_name, &color_a_y, &color_a_cb, &color_a_cr) < 0) {
+        fprintf(stderr, "Error: Unknown color '%s'\n", color_a_name);
+        return 1;
+    }
+    if (parse_color(color_b_name, &color_b_y, &color_b_cb, &color_b_cr) < 0) {
+        fprintf(stderr, "Error: Unknown color '%s'\n", color_b_name);
+        return 1;
     }
 
     if (!input_file && !test_mode) {
@@ -142,6 +194,10 @@ int main(int argc, char *argv[]) {
         h264_encoder_init(&cfg, width, height);
 
         printf("Test mode: %dx%d, %d frames\n", width, height, num_frames);
+        printf("  Color A: %s (Y=%d, Cb=%d, Cr=%d)\n",
+               color_a_name, color_a_y, color_a_cb, color_a_cr);
+        printf("  Color B: %s (Y=%d, Cb=%d, Cr=%d)\n",
+               color_b_name, color_b_y, color_b_cb, color_b_cr);
 
         /* Generate and write SPS */
         uint8_t sps[256];
@@ -155,13 +211,13 @@ int main(int argc, char *argv[]) {
         nal_write_unit(&nw, NAL_REF_IDC_HIGHEST, NAL_TYPE_PPS, pps, pps_size, 1);
         printf("  PPS: %zu bytes\n", pps_size);
 
-        /* Generate reference frame A (IDR) */
-        printf("  Generating IDR frame A (gray placeholder)...\n");
-        h264_write_idr_frame(&nw, &cfg);
+        /* Generate reference frame A (IDR) with color */
+        printf("  Generating IDR frame A (%s)...\n", color_a_name);
+        h264_write_idr_frame_color(&nw, &cfg, color_a_y, color_a_cb, color_a_cr);
 
-        /* Generate reference frame B (non-IDR I-frame) */
-        printf("  Generating non-IDR I-frame B (gray placeholder)...\n");
-        h264_write_non_idr_i_frame(&nw, &cfg);
+        /* Generate reference frame B (non-IDR I-frame) with color */
+        printf("  Generating non-IDR I-frame B (%s)...\n", color_b_name);
+        h264_write_non_idr_i_frame_color(&nw, &cfg, color_b_y, color_b_cb, color_b_cr);
 
         printf("  Setup complete: frame_num=%d\n", cfg.frame_num);
 
@@ -243,10 +299,28 @@ int main(int argc, char *argv[]) {
 
         printf("Found SPS, PPS, %d IDR frames\n", idr_count);
 
-        /* Copy entire input file to output (all NAL units with their start codes) */
-        /* This preserves the exact structure from x264/FFmpeg */
-        memcpy(output, input, input_size);
-        nw.output_pos = input_size;
+        /* Write our own SPS with larger max_frame_num to avoid wrap-around issues */
+        uint8_t our_sps[256];
+        size_t our_sps_size = h264_generate_sps(our_sps, sizeof(our_sps), width, height);
+        nal_write_unit(&nw, NAL_REF_IDC_HIGH, NAL_TYPE_SPS, our_sps, our_sps_size, 1);
+
+        /* Copy PPS and I-frames from input, skip x264's SPS */
+        for (int i = 0; i < nal_count; i++) {
+            uint8_t *nal_start = input + nal_positions[i];
+            size_t nal_size = nal_sizes[i];
+            /* Find NAL type after start code */
+            int offset = (nal_start[2] == 1) ? 3 : 4;
+            uint8_t nal_type = nal_start[offset] & 0x1f;
+
+            /* Skip SPS (we wrote our own), copy everything else */
+            if (nal_type != NAL_TYPE_SPS) {
+                memcpy(output + nw.output_pos, nal_start, nal_size);
+                nw.output_pos += nal_size;
+            }
+        }
+
+        /* Use our larger log2_max_frame_num */
+        cfg.log2_max_frame_num = 9;
 
         /* Set frame_num to 2 since we have 2 reference frames from input */
         cfg.frame_num = 2;

@@ -108,15 +108,33 @@ size_t h264_generate_pps(uint8_t *rbsp, size_t capacity);
 
 /*
  * Write an IDR I-frame (reference picture A)
- * Uses I16x16 DC prediction with zero residual (gray output)
+ * Uses I_PCM macroblocks (gray output by default)
  */
 size_t h264_write_idr_frame(NALWriter *nw, H264EncoderConfig *cfg);
 
 /*
+ * Write an IDR I-frame with specified YCbCr color
+ *
+ * Common colors (BT.601):
+ *   Red:   y=81,  cb=90,  cr=240
+ *   Blue:  y=41,  cb=240, cr=110
+ *   Green: y=145, cb=54,  cr=34
+ *   Gray:  y=128, cb=128, cr=128
+ */
+size_t h264_write_idr_frame_color(NALWriter *nw, H264EncoderConfig *cfg,
+                                   uint8_t y, uint8_t cb, uint8_t cr);
+
+/*
  * Write a non-IDR I-frame (reference picture B)
- * Uses I16x16 DC prediction with zero residual
+ * Uses I_PCM macroblocks
  * frame_num should be 1 (following the IDR which has frame_num=0)
  */
 size_t h264_write_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg);
+
+/*
+ * Write a non-IDR I-frame with specified YCbCr color
+ */
+size_t h264_write_non_idr_i_frame_color(NALWriter *nw, H264EncoderConfig *cfg,
+                                         uint8_t y, uint8_t cb, uint8_t cr);
 
 #endif /* H264_ENCODER_H */
