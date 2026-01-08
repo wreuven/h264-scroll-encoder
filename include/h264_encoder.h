@@ -28,6 +28,16 @@
 #define P_MB_L0_16x16   0   /* P_L0_16x16: single 16x16 partition, list 0 */
 #define P_MB_SKIP       -1  /* P_Skip (special, not written as mb_type) */
 
+/* Maximum number of waypoint references */
+#define MAX_WAYPOINTS 8
+
+/* Waypoint info for intermediate reference frames */
+typedef struct {
+    int offset_mb;          /* Scroll offset at which this waypoint was created */
+    int long_term_idx;      /* Long-term frame index (2, 3, 4, ...) */
+    int valid;              /* Whether this waypoint is active */
+} WaypointInfo;
+
 /* Encoder configuration */
 typedef struct {
     int width;              /* Frame width in pixels (must be multiple of 16) */
@@ -53,6 +63,10 @@ typedef struct {
     /* Frame tracking */
     int frame_num;          /* Current frame_num (wraps at max_frame_num) */
     int idr_pic_id;         /* IDR picture ID */
+
+    /* Waypoint support for extended scroll range */
+    WaypointInfo waypoints[MAX_WAYPOINTS];
+    int num_waypoints;      /* Number of active waypoints */
 } H264EncoderConfig;
 
 /* Initialize encoder config from frame dimensions */
@@ -94,6 +108,30 @@ void h264_write_p16x16_mb(BitWriter *bw, int ref_idx, int mvd_x, int mvd_y);
  *   - For mb_y in [mb_height - offset_mb, mb_height): use ref B with appropriate MV
  */
 size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_mb);
+
+/*
+ * Write a waypoint P-frame (reference P-frame for extended scroll range)
+ *
+ * This creates a P-frame at the given scroll offset and marks it as a
+ * long-term reference using MMCO commands. Subsequent P-frames can
+ * reference this waypoint with smaller MVs.
+ *
+ * Parameters:
+ *   nw          - NAL writer for output
+ *   cfg         - Encoder config
+ *   offset_mb   - Scroll offset for this waypoint
+ *
+ * Returns: bytes written
+ */
+size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_mb);
+
+/*
+ * Check if a waypoint is needed at the given scroll offset
+ *
+ * Returns 1 if a waypoint should be inserted, 0 otherwise.
+ * Waypoints are needed every 31 MB to keep MVs within hardware limits.
+ */
+int h264_needs_waypoint(H264EncoderConfig *cfg, int offset_mb);
 
 /*
  * Generate a minimal SPS for Baseline profile

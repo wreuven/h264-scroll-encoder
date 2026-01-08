@@ -381,16 +381,14 @@ int main(int argc, char *argv[]) {
 
     /* Generate scroll P-frames */
     int mb_height = height / 16;
+    int max_offset_mb = mb_height - 1;  /* Full scroll range */
 
     /*
-     * NVDEC hardware limit: max MV is 512 pixels (2048 qpel) regardless of H.264 level.
-     * To ensure hardware compatibility, cap scroll offset at 31 MB (496 pixels MV).
-     * This limits scroll to ~69% of frame height but avoids decoder corruption.
+     * Waypoint support: Insert reference P-frames at scroll positions that would
+     * otherwise require MVs exceeding hardware limits (512px). Waypoints allow
+     * subsequent frames to use smaller MVs relative to the waypoint.
      */
-    int max_offset_mb = 31;  /* 31 * 16 = 496 pixels = 1984 qpel < 2048 limit */
-    if (max_offset_mb > mb_height - 1) {
-        max_offset_mb = mb_height - 1;
-    }
+    int waypoints_created = 0;
 
     for (int i = 0; i < num_frames; i++) {
         /* Calculate scroll offset: go from 0 to max_offset and back */
@@ -403,11 +401,22 @@ int main(int argc, char *argv[]) {
             offset_mb = max_offset_mb * 2 - cycle_pos;  /* Scrolling back */
         }
 
-        h264_write_scroll_p_frame(&nw, &cfg, offset_mb);
+        /* Check if we need a waypoint at this offset */
+        if (h264_needs_waypoint(&cfg, offset_mb)) {
+            printf("  Creating waypoint at offset=%d MB (frame %d)\n", offset_mb, i + 1);
+            h264_write_waypoint_p_frame(&nw, &cfg, offset_mb);
+            waypoints_created++;
+        } else {
+            h264_write_scroll_p_frame(&nw, &cfg, offset_mb);
+        }
 
         if ((i + 1) % 10 == 0) {
             printf("  Frame %d/%d (offset=%d MB)\n", i + 1, num_frames, offset_mb);
         }
+    }
+
+    if (waypoints_created > 0) {
+        printf("Created %d waypoint reference frames for extended scroll range\n", waypoints_created);
     }
 
     size_t output_size = nal_writer_get_size(&nw);

@@ -4,6 +4,14 @@
 #include <assert.h>
 #include <stdio.h>
 
+/* Hardware MV limit: 31 MB = 496 pixels = 1984 qpel (safely under 2048) */
+#define WAYPOINT_INTERVAL_MB 31
+
+/* Forward declarations for waypoint support */
+static void h264_write_p_slice_header_waypoint(BitWriter *bw, H264EncoderConfig *cfg,
+                                                int first_mb, int frame_num, int poc_lsb,
+                                                int is_reference, int long_term_idx);
+
 void h264_encoder_init(H264EncoderConfig *cfg, int width, int height) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->width = width;
@@ -75,8 +83,8 @@ size_t h264_generate_sps(uint8_t *rbsp, size_t capacity, int width, int height) 
     /* pic_order_cnt_type: ue(2) -> POC = 2*frame_num for frames */
     bitwriter_write_ue(&bw, 2);
 
-    /* max_num_ref_frames: ue(2) -> we need 2 refs (A and B) */
-    bitwriter_write_ue(&bw, 2);
+    /* max_num_ref_frames: ue(v) -> we need 2 base refs (A and B) + waypoints */
+    bitwriter_write_ue(&bw, 2 + MAX_WAYPOINTS);  /* 10 refs max */
 
     /* gaps_in_frame_num_value_allowed_flag: u(1) = 0 */
     bitwriter_write_bit(&bw, 0);
@@ -273,13 +281,27 @@ void h264_write_p16x16_mb(BitWriter *bw, int ref_idx, int mvd_x, int mvd_y) {
 /*
  * Write P16x16 macroblock with MVD already in quarter-pel units
  * Used when MV prediction is computed in quarter-pel
+ *
+ * num_refs: number of active references (for te(v) encoding of ref_idx)
  */
-static void h264_write_p16x16_mb_qpel(BitWriter *bw, int ref_idx, int mvd_x_qpel, int mvd_y_qpel) {
+static void h264_write_p16x16_mb_qpel(BitWriter *bw, int ref_idx, int mvd_x_qpel, int mvd_y_qpel, int num_refs) {
     /* mb_type: ue(0) = P_L0_16x16 */
     bitwriter_write_ue(bw, 0);
 
-    /* ref_idx_l0[0]: te(v) with range [0,1] - inverted for our reference list ordering */
-    bitwriter_write_bit(bw, 1 - (ref_idx & 1));
+    /* ref_idx_l0[0]: te(v) where v = num_ref_idx_l0_active_minus1
+     * te(0) = no bits (only one ref)
+     * te(1) = single bit (0->1, 1->0)
+     * te(v>1) = ue(v)
+     */
+    if (num_refs == 1) {
+        /* No ref_idx written - only one possible value */
+    } else if (num_refs == 2) {
+        /* te(1): single bit, inverted */
+        bitwriter_write_bit(bw, 1 - (ref_idx & 1));
+    } else {
+        /* te(v>1): use ue() encoding */
+        bitwriter_write_ue(bw, ref_idx);
+    }
 
     /* mvd_l0[0][0]: se(mvd_x) - already in quarter-pel */
     bitwriter_write_se(bw, mvd_x_qpel);
@@ -417,8 +439,12 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
     int max_frame_num = 1 << cfg->log2_max_frame_num;
     int frame_num = cfg->frame_num % max_frame_num;
 
-    /* Write slice header - is_reference=0 for non-reference P-frames */
-    h264_write_p_slice_header(&bw, cfg, 0, frame_num, frame_num * 2, 0);
+    /* Use waypoint-aware slice header if we have waypoints */
+    if (cfg->num_waypoints > 0) {
+        h264_write_p_slice_header_waypoint(&bw, cfg, 0, frame_num, frame_num * 2, 0, -1);
+    } else {
+        h264_write_p_slice_header(&bw, cfg, 0, frame_num, frame_num * 2, 0);
+    }
 
     /*
      * Scroll composition logic:
@@ -430,6 +456,23 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
      */
 
     int a_region_end = cfg->mb_height - offset_mb;  /* First row of B region */
+
+    /* Find best waypoint for A region if offset exceeds direct MV limit */
+    int wp_idx = -1;
+    int wp_offset = 0;
+    if (offset_mb > WAYPOINT_INTERVAL_MB && cfg->num_waypoints > 0) {
+        for (int i = 0; i < cfg->num_waypoints; i++) {
+            if (!cfg->waypoints[i].valid) continue;
+            int wo = cfg->waypoints[i].offset_mb;
+            if (wo <= offset_mb && wo > wp_offset) {
+                int delta = offset_mb - wo;
+                if (delta * 16 <= 496) {  /* Within HW limit */
+                    wp_idx = i;
+                    wp_offset = wo;
+                }
+            }
+        }
+    }
 
     /* Allocate MV tracking arrays for prediction */
     MVInfo *above_row = calloc(cfg->mb_width, sizeof(MVInfo));
@@ -447,9 +490,16 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
             int mv_x = 0;  /* No horizontal scroll */
 
             if (mb_y < a_region_end) {
-                /* A region: reference A (long-term ref with LongTermPicNum=0 = ref_idx 0) */
-                ref_idx = 0;
-                mv_y = offset_mb * 16;  /* Convert MB offset to pixels */
+                /* A region */
+                if (wp_idx >= 0) {
+                    /* Use waypoint instead of A to keep MV within HW limit */
+                    ref_idx = 2 + wp_idx;  /* Waypoint ref index */
+                    mv_y = (offset_mb - wp_offset) * 16;
+                } else {
+                    /* Use A directly (offset within limit) */
+                    ref_idx = 0;
+                    mv_y = offset_mb * 16;  /* Convert MB offset to pixels */
+                }
             } else {
                 /* B region: reference B (long-term ref with LongTermPicNum=1 = ref_idx 1) */
                 ref_idx = 1;
@@ -491,7 +541,8 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
                 skip_count = 0;
 
                 /* Write the macroblock (mvd is already in quarter-pel) */
-                h264_write_p16x16_mb_qpel(&bw, ref_idx, mvd_x, mvd_y);
+                int num_refs = 2 + cfg->num_waypoints;
+                h264_write_p16x16_mb_qpel(&bw, ref_idx, mvd_x, mvd_y, num_refs);
             }
 
             /* Update MV tracking for next MB's prediction */
@@ -1057,4 +1108,265 @@ size_t h264_rewrite_as_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg,
                                         const uint8_t *rbsp, size_t rbsp_size,
                                         int frame_num) {
     return h264_rewrite_as_non_idr_i_frame_ex(nw, cfg, cfg, rbsp, rbsp_size, frame_num);
+}
+
+/* ============================================================================
+ * WAYPOINT SUPPORT FOR EXTENDED SCROLL RANGE
+ * ============================================================================
+ *
+ * Hardware decoders (NVDEC, VAAPI) limit vertical MVs to 512 pixels (2048 qpel).
+ * Waypoints are intermediate P-frames marked as long-term references that allow
+ * subsequent frames to use smaller MVs.
+ *
+ * Example for 720p (45 MB):
+ *   - Scroll 0-31: Reference A directly (MV 0-496px)
+ *   - Scroll 31: Create waypoint (long-term ref 2)
+ *   - Scroll 32-45: Reference waypoint (MV 16-224px) instead of A (512-720px)
+ */
+
+/* Hardware MV limit: 31 MB = 496 pixels = 1984 qpel (safely under 2048) */
+#define WAYPOINT_INTERVAL_MB 31
+
+/*
+ * Check if a waypoint is needed at the given scroll offset
+ */
+int h264_needs_waypoint(H264EncoderConfig *cfg, int offset_mb) {
+    /* Need waypoint at multiples of WAYPOINT_INTERVAL_MB */
+    if (offset_mb == 0) return 0;  /* Never at offset 0 */
+    if (offset_mb % WAYPOINT_INTERVAL_MB != 0) return 0;
+
+    /* Check if we already have a waypoint at this offset */
+    for (int i = 0; i < cfg->num_waypoints; i++) {
+        if (cfg->waypoints[i].valid && cfg->waypoints[i].offset_mb == offset_mb) {
+            return 0;  /* Already have this waypoint */
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * Find the best waypoint to use for a given scroll offset
+ * Returns the waypoint index, or -1 if should use original refs
+ */
+static int find_best_waypoint(H264EncoderConfig *cfg, int offset_mb) {
+    int best_idx = -1;
+    int best_offset = 0;
+
+    /* Find the highest waypoint offset that's <= current offset and within MV range */
+    for (int i = 0; i < cfg->num_waypoints; i++) {
+        if (!cfg->waypoints[i].valid) continue;
+
+        int wp_offset = cfg->waypoints[i].offset_mb;
+        if (wp_offset <= offset_mb && wp_offset > best_offset) {
+            /* Check if using this waypoint keeps MV within limit */
+            int delta = offset_mb - wp_offset;
+            if (delta * 16 <= 496) {  /* 496px = 31 MB, within HW limit */
+                best_idx = i;
+                best_offset = wp_offset;
+            }
+        }
+    }
+
+    return best_idx;
+}
+
+/*
+ * Write P-slice header with waypoint support
+ *
+ * num_refs: 2 (A, B) or 3+ (A, B, waypoints)
+ * For waypoint frames, is_reference=1 and writes MMCO to mark as long-term
+ */
+static void h264_write_p_slice_header_waypoint(BitWriter *bw, H264EncoderConfig *cfg,
+                                                int first_mb, int frame_num, int poc_lsb,
+                                                int is_reference, int long_term_idx) {
+    /* first_mb_in_slice: ue(v) */
+    bitwriter_write_ue(bw, first_mb);
+
+    /* slice_type: ue(v) = 0 (P-slice) */
+    bitwriter_write_ue(bw, SLICE_TYPE_P);
+
+    /* pic_parameter_set_id: ue(0) */
+    bitwriter_write_ue(bw, 0);
+
+    /* frame_num: u(log2_max_frame_num) */
+    int frame_num_bits = cfg->log2_max_frame_num;
+    bitwriter_write_bits(bw, frame_num & ((1 << frame_num_bits) - 1), frame_num_bits);
+
+    /* If pic_order_cnt_type == 0, write POC LSB */
+    if (cfg->pic_order_cnt_type == 0) {
+        int poc_bits = cfg->log2_max_pic_order_cnt_lsb;
+        bitwriter_write_bits(bw, poc_lsb & ((1 << poc_bits) - 1), poc_bits);
+    }
+
+    /* num_ref_idx_active_override_flag: u(1) = 1 */
+    bitwriter_write_bit(bw, 1);
+
+    /* num_ref_idx_l0_active_minus1: number of refs - 1 */
+    int num_refs = 2 + cfg->num_waypoints;  /* A, B, plus waypoints */
+    bitwriter_write_ue(bw, num_refs - 1);
+
+    /* ref_pic_list_modification */
+    bitwriter_write_bit(bw, 1);  /* flag = 1 */
+
+    /* Build ref list: A(ltp=0), B(ltp=1), waypoints(ltp=2,3,...) */
+    bitwriter_write_ue(bw, 2);  /* modification_of_pic_nums_idc = 2 */
+    bitwriter_write_ue(bw, 0);  /* long_term_pic_num = 0 (A) */
+
+    bitwriter_write_ue(bw, 2);
+    bitwriter_write_ue(bw, 1);  /* long_term_pic_num = 1 (B) */
+
+    /* Add waypoints to ref list */
+    for (int i = 0; i < cfg->num_waypoints; i++) {
+        if (cfg->waypoints[i].valid) {
+            bitwriter_write_ue(bw, 2);
+            bitwriter_write_ue(bw, cfg->waypoints[i].long_term_idx);
+        }
+    }
+
+    bitwriter_write_ue(bw, 3);  /* End of modification */
+
+    /* dec_ref_pic_marking() */
+    if (is_reference) {
+        if (long_term_idx >= 0) {
+            /* Mark this frame as long-term reference using MMCO */
+            bitwriter_write_bit(bw, 1);  /* adaptive_ref_pic_marking_mode_flag = 1 */
+
+            /* MMCO 4: set max_long_term_frame_idx to allow this index
+             * max_long_term_frame_idx_plus1 = long_term_idx + 1
+             * This extends the allowed range of long-term indices */
+            bitwriter_write_ue(bw, 4);   /* memory_management_control_operation = 4 */
+            bitwriter_write_ue(bw, long_term_idx + 1);  /* max_long_term_frame_idx_plus1 */
+
+            /* MMCO 6: mark current as long-term with given idx */
+            bitwriter_write_ue(bw, 6);   /* memory_management_control_operation = 6 */
+            bitwriter_write_ue(bw, long_term_idx);  /* long_term_frame_idx */
+
+            /* MMCO 0: end of MMCO commands */
+            bitwriter_write_ue(bw, 0);
+        } else {
+            /* Sliding window reference management */
+            bitwriter_write_bit(bw, 0);
+        }
+    }
+
+    /* slice_qp_delta: se(0) */
+    bitwriter_write_se(bw, 0);
+
+    /* deblocking filter */
+    if (cfg->deblocking_filter_control_present_flag) {
+        bitwriter_write_ue(bw, 1);  /* disable deblocking */
+    }
+}
+
+/*
+ * Write a waypoint P-frame
+ *
+ * This creates a P-frame at the given scroll offset and marks it as
+ * a long-term reference for subsequent frames to use.
+ */
+size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_mb) {
+    uint8_t rbsp[1024 * 1024];
+    BitWriter bw;
+    bitwriter_init(&bw, rbsp, sizeof(rbsp));
+
+    int max_frame_num = 1 << cfg->log2_max_frame_num;
+    int frame_num = cfg->frame_num % max_frame_num;
+
+    /* Assign long-term index for this waypoint (starting at 2, since A=0, B=1) */
+    int long_term_idx = 2 + cfg->num_waypoints;
+
+    /* Write slice header with MMCO to mark as long-term */
+    h264_write_p_slice_header_waypoint(&bw, cfg, 0, frame_num, frame_num * 2,
+                                        1, long_term_idx);  /* is_reference=1 */
+
+    /* Write macroblock data (same as regular scroll frame) */
+    int a_region_end = cfg->mb_height - offset_mb;
+
+    MVInfo *above_row = calloc(cfg->mb_width, sizeof(MVInfo));
+    MVInfo *current_row = calloc(cfg->mb_width, sizeof(MVInfo));
+    MVInfo left = {0};
+    int skip_count = 0;
+
+    /* For waypoint, we may need to use an existing waypoint for the A region */
+    int wp_idx = find_best_waypoint(cfg, offset_mb);
+
+    for (int mb_y = 0; mb_y < cfg->mb_height; mb_y++) {
+        left.available = 0;
+
+        for (int mb_x = 0; mb_x < cfg->mb_width; mb_x++) {
+            int ref_idx;
+            int mv_y;
+            int mv_x = 0;
+
+            if (mb_y < a_region_end) {
+                /* A region */
+                if (wp_idx >= 0 && offset_mb > WAYPOINT_INTERVAL_MB) {
+                    /* Use waypoint instead of A */
+                    int wp_offset = cfg->waypoints[wp_idx].offset_mb;
+                    ref_idx = 2 + wp_idx;  /* Waypoint ref index */
+                    mv_y = (offset_mb - wp_offset) * 16;
+                } else {
+                    /* Use A directly */
+                    ref_idx = 0;
+                    mv_y = offset_mb * 16;
+                }
+            } else {
+                /* B region */
+                ref_idx = 1;
+                mv_y = (offset_mb - cfg->mb_height) * 16;
+            }
+
+            int mv_x_qpel = mv_x * 4;
+            int mv_y_qpel = mv_y * 4;
+
+            int pred_mvx, pred_mvy;
+            get_mv_prediction_ex(mb_x, mb_y, cfg->mb_width, above_row, &left,
+                                 ref_idx, &pred_mvx, &pred_mvy);
+
+            int mvd_x = mv_x_qpel - pred_mvx;
+            int mvd_y = mv_y_qpel - pred_mvy;
+
+            bitwriter_write_ue(&bw, skip_count);
+            skip_count = 0;
+            /* num_refs includes existing waypoints (not the one being created) */
+            int num_refs = 2 + cfg->num_waypoints;
+            h264_write_p16x16_mb_qpel(&bw, ref_idx, mvd_x, mvd_y, num_refs);
+
+            current_row[mb_x].mv_x = mv_x_qpel;
+            current_row[mb_x].mv_y = mv_y_qpel;
+            current_row[mb_x].ref_idx = ref_idx;
+            current_row[mb_x].available = 1;
+            left = current_row[mb_x];
+        }
+
+        MVInfo *tmp = above_row;
+        above_row = current_row;
+        current_row = tmp;
+    }
+
+    if (skip_count > 0) {
+        bitwriter_write_ue(&bw, skip_count);
+    }
+
+    free(above_row);
+    free(current_row);
+
+    bitwriter_write_trailing_bits(&bw);
+    size_t rbsp_size = bitwriter_get_size(&bw);
+
+    /* Write as reference P-frame (nal_ref_idc = 2) */
+    size_t written = nal_write_unit(nw, NAL_REF_IDC_HIGH, NAL_TYPE_SLICE,
+                                    rbsp, rbsp_size, 1);
+
+    /* Register this waypoint */
+    if (cfg->num_waypoints < MAX_WAYPOINTS) {
+        cfg->waypoints[cfg->num_waypoints].offset_mb = offset_mb;
+        cfg->waypoints[cfg->num_waypoints].long_term_idx = long_term_idx;
+        cfg->waypoints[cfg->num_waypoints].valid = 1;
+        cfg->num_waypoints++;
+    }
+
+    cfg->frame_num++;
+    return written;
 }

@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>H.264 Scroll Encoder - Frame Viewer</title>
+    <style>
+        body {
+            background: #1a1a1a;
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+            margin: 0;
+        }
+        h1 {
+            margin-bottom: 10px;
+            font-weight: 300;
+        }
+        video {
+            max-width: 95%;
+            max-height: 70vh;
+            border: 2px solid #333;
+            border-radius: 4px;
+        }
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        button {
+            background: #333;
+            color: #fff;
+            border: 1px solid #555;
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #444;
+        }
+        button:active {
+            background: #555;
+        }
+        .frame-info {
+            margin-top: 15px;
+            font-size: 18px;
+            font-family: monospace;
+            background: #222;
+            padding: 10px 20px;
+            border-radius: 4px;
+        }
+        .keyboard-hint {
+            margin-top: 15px;
+            color: #888;
+            font-size: 14px;
+        }
+        kbd {
+            background: #333;
+            padding: 2px 8px;
+            border-radius: 3px;
+            border: 1px solid #555;
+        }
+    </style>
+</head>
+<body>
+    <h1>H.264 Scroll Encoder</h1>
+    <video id="video" src="netflix_scroll_browser.mp4"></video>
+
+    <div class="controls">
+        <button onclick="prevFrame()">&#9664;&#9664; Prev Frame</button>
+        <button onclick="togglePlay()">Play / Pause</button>
+        <button onclick="nextFrame()">Next Frame &#9654;&#9654;</button>
+    </div>
+
+    <div class="frame-info">
+        Frame: <span id="frameNum">0</span> / <span id="totalFrames">0</span>
+        &nbsp;|&nbsp;
+        Time: <span id="timeDisplay">0.000</span>s
+    </div>
+
+    <div class="keyboard-hint">
+        Keyboard: <kbd>Space</kbd> Play/Pause &nbsp;
+        <kbd>,</kbd> Prev Frame &nbsp;
+        <kbd>.</kbd> Next Frame &nbsp;
+        <kbd>Home</kbd> Start &nbsp;
+        <kbd>End</kbd> End
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const frameNumEl = document.getElementById('frameNum');
+        const totalFramesEl = document.getElementById('totalFrames');
+        const timeDisplayEl = document.getElementById('timeDisplay');
+
+        const FPS = 30;
+        const FRAME_TIME = 1 / FPS;
+
+        video.addEventListener('loadedmetadata', () => {
+            const totalFrames = Math.round(video.duration * FPS);
+            totalFramesEl.textContent = totalFrames;
+            updateDisplay();
+        });
+
+        video.addEventListener('timeupdate', updateDisplay);
+
+        function updateDisplay() {
+            const currentFrame = Math.round(video.currentTime * FPS);
+            frameNumEl.textContent = currentFrame;
+            timeDisplayEl.textContent = video.currentTime.toFixed(3);
+        }
+
+        function nextFrame() {
+            video.pause();
+            video.currentTime = Math.min(video.duration, video.currentTime + FRAME_TIME);
+            updateDisplay();
+        }
+
+        function prevFrame() {
+            video.pause();
+            video.currentTime = Math.max(0, video.currentTime - FRAME_TIME);
+            updateDisplay();
+        }
+
+        function togglePlay() {
+            if (video.paused) {
+                video.play();
+            } else {
+                video.pause();
+            }
+        }
+
+        document.addEventListener('keydown', (e) => {
+            switch(e.key) {
+                case ' ':
+                    e.preventDefault();
+                    togglePlay();
+                    break;
+                case ',':
+                case 'ArrowLeft':
+                    e.preventDefault();
+                    prevFrame();
+                    break;
+                case '.':
+                case 'ArrowRight':
+                    e.preventDefault();
+                    nextFrame();
+                    break;
+                case 'Home':
+                    e.preventDefault();
+                    video.currentTime = 0;
+                    break;
+                case 'End':
+                    e.preventDefault();
+                    video.currentTime = video.duration;
+                    break;
+            }
+        });
+    </script>
+</body>
+</html>

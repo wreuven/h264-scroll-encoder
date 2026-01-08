@@ -11,9 +11,9 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-# Input images (default to Netflix frames if they exist)
-IMAGE_A=${1:-netflix_frame_a.png}
-IMAGE_B=${2:-netflix_frame_b.png}
+# Input images (default to frame_a.png and frame_b.png)
+IMAGE_A=${1:-frame_a.png}
+IMAGE_B=${2:-frame_b.png}
 OUTPUT=${3:-netflix_scroll_browser.mp4}
 
 # Configuration
