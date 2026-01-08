@@ -4,9 +4,6 @@
 #include <assert.h>
 #include <stdio.h>
 
-/* Hardware MV limit: 31 MB = 496 pixels = 1984 qpel (safely under 2048) */
-#define WAYPOINT_INTERVAL_MB 31
-
 /* Forward declarations for waypoint support */
 static void h264_write_p_slice_header_waypoint(BitWriter *bw, H264EncoderConfig *cfg,
                                                 int first_mb, int frame_num, int poc_lsb,
@@ -458,17 +455,42 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
     int a_region_end = cfg->mb_height - offset_mb;  /* First row of B region */
 
     /* Find best waypoint for A region if offset exceeds direct MV limit */
-    int wp_idx = -1;
-    int wp_offset = 0;
+    int wp_idx_a = -1;
+    int wp_offset_a = 0;
     if (offset_mb > WAYPOINT_INTERVAL_MB && cfg->num_waypoints > 0) {
         for (int i = 0; i < cfg->num_waypoints; i++) {
             if (!cfg->waypoints[i].valid) continue;
             int wo = cfg->waypoints[i].offset_mb;
-            if (wo <= offset_mb && wo > wp_offset) {
+            if (wo <= offset_mb && wo > wp_offset_a) {
                 int delta = offset_mb - wo;
                 if (delta * 16 <= 496) {  /* Within HW limit */
-                    wp_idx = i;
-                    wp_offset = wo;
+                    wp_idx_a = i;
+                    wp_offset_a = wo;
+                }
+            }
+        }
+    }
+
+    /* Find best waypoint for B region if offset is small (B's MV would exceed limit)
+     * B's direct MV = (offset_mb - mb_height) * 16
+     * Limit exceeded when: (offset_mb - mb_height) * 16 < -512
+     *                      i.e., mb_height - offset_mb > 32
+     * Using waypoint: MV = (offset_mb - wp_offset) * 16
+     */
+    int wp_idx_b = -1;
+    int wp_offset_b = 0;
+    int b_direct_mv = (offset_mb - cfg->mb_height) * 16;
+    if (b_direct_mv < -496 && cfg->num_waypoints > 0) {
+        for (int i = 0; i < cfg->num_waypoints; i++) {
+            if (!cfg->waypoints[i].valid) continue;
+            int wo = cfg->waypoints[i].offset_mb;
+            /* Waypoint must be at higher offset than us, so MV is negative but smaller */
+            if (wo > offset_mb) {
+                int delta = offset_mb - wo;  /* Negative */
+                if (delta * 16 >= -496) {  /* Within HW limit */
+                    wp_idx_b = i;
+                    wp_offset_b = wo;
+                    break;  /* First valid waypoint is fine */
                 }
             }
         }
@@ -491,19 +513,26 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
 
             if (mb_y < a_region_end) {
                 /* A region */
-                if (wp_idx >= 0) {
+                if (wp_idx_a >= 0) {
                     /* Use waypoint instead of A to keep MV within HW limit */
-                    ref_idx = 2 + wp_idx;  /* Waypoint ref index */
-                    mv_y = (offset_mb - wp_offset) * 16;
+                    ref_idx = 2 + wp_idx_a;  /* Waypoint ref index */
+                    mv_y = (offset_mb - wp_offset_a) * 16;
                 } else {
                     /* Use A directly (offset within limit) */
                     ref_idx = 0;
                     mv_y = offset_mb * 16;  /* Convert MB offset to pixels */
                 }
             } else {
-                /* B region: reference B (long-term ref with LongTermPicNum=1 = ref_idx 1) */
-                ref_idx = 1;
-                mv_y = (offset_mb - cfg->mb_height) * 16;  /* Negative offset in pixels */
+                /* B region */
+                if (wp_idx_b >= 0) {
+                    /* Use waypoint instead of B to keep MV within HW limit */
+                    ref_idx = 2 + wp_idx_b;  /* Waypoint ref index */
+                    mv_y = (offset_mb - wp_offset_b) * 16;  /* Negative, but smaller */
+                } else {
+                    /* Use B directly */
+                    ref_idx = 1;
+                    mv_y = (offset_mb - cfg->mb_height) * 16;
+                }
             }
 
             /* MVs are in quarter-pel in the bitstream, so multiply by 4 */
@@ -1123,9 +1152,6 @@ size_t h264_rewrite_as_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg,
  *   - Scroll 31: Create waypoint (long-term ref 2)
  *   - Scroll 32-45: Reference waypoint (MV 16-224px) instead of A (512-720px)
  */
-
-/* Hardware MV limit: 31 MB = 496 pixels = 1984 qpel (safely under 2048) */
-#define WAYPOINT_INTERVAL_MB 31
 
 /*
  * Check if a waypoint is needed at the given scroll offset

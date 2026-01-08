@@ -384,21 +384,31 @@ int main(int argc, char *argv[]) {
     int max_offset_mb = mb_height - 1;  /* Full scroll range */
 
     /*
-     * Waypoint support: Insert reference P-frames at scroll positions that would
-     * otherwise require MVs exceeding hardware limits (512px). Waypoints allow
-     * subsequent frames to use smaller MVs relative to the waypoint.
+     * Waypoint support: Start scroll at offset 31 (safe MV range for both A and B).
+     * This first frame becomes a waypoint that can be referenced for:
+     * - High offsets (>31): A region uses waypoint instead of frame A
+     * - Low offsets (<14): B region uses waypoint instead of frame B
+     *
+     * Hardware decoders limit MVs to 512 pixels. At offset 31:
+     * - A region MV = +496 (safe)
+     * - B region MV = -224 (safe)
      */
     int waypoints_created = 0;
+    int start_offset = WAYPOINT_INTERVAL_MB;  /* Start at 31 */
 
     for (int i = 0; i < num_frames; i++) {
-        /* Calculate scroll offset: go from 0 to max_offset and back */
-        int cycle_pos = i % (max_offset_mb * 2);
+        /*
+         * Scroll pattern: start at 31, go to max, back to 0, back to 31...
+         * Pattern: 31 -> 44 -> 0 -> 44 -> 0 -> ...
+         */
+        int cycle_len = max_offset_mb * 2;
+        int cycle_pos = (i + start_offset) % cycle_len;
         int offset_mb;
 
         if (cycle_pos < max_offset_mb) {
             offset_mb = cycle_pos;  /* Scrolling down (A up, B appears) */
         } else {
-            offset_mb = max_offset_mb * 2 - cycle_pos;  /* Scrolling back */
+            offset_mb = cycle_len - cycle_pos;  /* Scrolling back */
         }
 
         /* Check if we need a waypoint at this offset */

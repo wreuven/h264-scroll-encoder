@@ -31,6 +31,9 @@
 /* Maximum number of waypoint references */
 #define MAX_WAYPOINTS 8
 
+/* Hardware MV limit: 31 MB = 496 pixels = 1984 qpel (safely under 2048) */
+#define WAYPOINT_INTERVAL_MB 31
+
 /* Waypoint info for intermediate reference frames */
 typedef struct {
     int offset_mb;          /* Scroll offset at which this waypoint was created */
