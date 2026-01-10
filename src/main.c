@@ -47,7 +47,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -i, --input FILE     Input H.264 file with 2 I-frames (A and B)\n");
     fprintf(stderr, "  -o, --output FILE    Output H.264 file (default: output.h264)\n");
-    fprintf(stderr, "  -n, --frames N       Number of scroll frames to generate (default: 60)\n");
+    fprintf(stderr, "  -n, --frames N       Number of scroll frames to generate (default: 900)\n");
+    fprintf(stderr, "  -S, --speed N        Scroll speed in pixels per frame (default: 1)\n");
     fprintf(stderr, "  -w, --width W        Frame width (if not using input file)\n");
     fprintf(stderr, "  -h, --height H       Frame height (if not using input file)\n");
     fprintf(stderr, "  -t, --test           Generate test stream (no input file needed)\n");
@@ -121,6 +122,7 @@ int main(int argc, char *argv[]) {
     const char *input_file = NULL;
     const char *output_file = "output.h264";
     int num_frames = 900;  /* 30 seconds at 30fps */
+    int scroll_speed = 1;  /* Pixels per frame */
     int width = 0, height = 0;
     int test_mode = 1;     /* Default to test mode */
     int striped_mode = 1;  /* Default to striped */
@@ -131,6 +133,7 @@ int main(int argc, char *argv[]) {
         {"input", required_argument, 0, 'i'},
         {"output", required_argument, 0, 'o'},
         {"frames", required_argument, 0, 'n'},
+        {"speed", required_argument, 0, 'S'},
         {"width", required_argument, 0, 'w'},
         {"height", required_argument, 0, 'H'},
         {"test", no_argument, 0, 't'},
@@ -142,11 +145,12 @@ int main(int argc, char *argv[]) {
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "i:o:n:w:H:ts", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:o:n:S:w:H:ts", long_options, NULL)) != -1) {
         switch (c) {
             case 'i': input_file = optarg; test_mode = 0; break;
             case 'o': output_file = optarg; break;
             case 'n': num_frames = atoi(optarg); break;
+            case 'S': scroll_speed = atoi(optarg); break;
             case 'w': width = atoi(optarg); break;
             case 'H': height = atoi(optarg); break;
             case 't': test_mode = 1; break;
@@ -380,48 +384,47 @@ int main(int argc, char *argv[]) {
     printf("Generating %d scroll frames...\n", num_frames);
 
     /* Generate scroll P-frames */
-    int mb_height = height / 16;
-    int max_offset_mb = mb_height - 1;  /* Full scroll range */
+    int max_offset_px = height - 16;  /* Full scroll range in pixels (leave 1 MB at bottom) */
 
     /*
-     * Waypoint support: Start scroll at offset 31 (safe MV range for both A and B).
+     * Waypoint support: Start scroll at offset 496px (safe MV range for both A and B).
      * This first frame becomes a waypoint that can be referenced for:
-     * - High offsets (>31): A region uses waypoint instead of frame A
-     * - Low offsets (<14): B region uses waypoint instead of frame B
+     * - High offsets (>496): A region uses waypoint instead of frame A
+     * - Low offsets (<224): B region uses waypoint instead of frame B
      *
-     * Hardware decoders limit MVs to 512 pixels. At offset 31:
+     * Hardware decoders limit MVs to 512 pixels. At offset 496:
      * - A region MV = +496 (safe)
-     * - B region MV = -224 (safe)
+     * - B region MV = -224 (safe for 720p)
      */
     int waypoints_created = 0;
-    int start_offset = WAYPOINT_INTERVAL_MB;  /* Start at 31 */
+    int start_offset_px = MV_LIMIT_PX;  /* Start at 496px */
 
     for (int i = 0; i < num_frames; i++) {
         /*
-         * Scroll pattern: start at 31, go to max, back to 0, back to 31...
-         * Pattern: 31 -> 44 -> 0 -> 44 -> 0 -> ...
+         * Scroll pattern: start at 496, go to max, back to 0, back to max...
+         * scroll_speed controls pixels per frame.
          */
-        int cycle_len = max_offset_mb * 2;
-        int cycle_pos = (i + start_offset) % cycle_len;
-        int offset_mb;
+        int cycle_len = max_offset_px * 2;
+        int cycle_pos = (i * scroll_speed + start_offset_px) % cycle_len;
+        int offset_px;
 
-        if (cycle_pos < max_offset_mb) {
-            offset_mb = cycle_pos;  /* Scrolling down (A up, B appears) */
+        if (cycle_pos < max_offset_px) {
+            offset_px = cycle_pos;  /* Scrolling down (A up, B appears) */
         } else {
-            offset_mb = cycle_len - cycle_pos;  /* Scrolling back */
+            offset_px = cycle_len - cycle_pos;  /* Scrolling back */
         }
 
         /* Check if we need a waypoint at this offset */
-        if (h264_needs_waypoint(&cfg, offset_mb)) {
-            printf("  Creating waypoint at offset=%d MB (frame %d)\n", offset_mb, i + 1);
-            h264_write_waypoint_p_frame(&nw, &cfg, offset_mb);
+        if (h264_needs_waypoint(&cfg, offset_px)) {
+            printf("  Creating waypoint at offset=%d px (frame %d)\n", offset_px, i + 1);
+            h264_write_waypoint_p_frame(&nw, &cfg, offset_px);
             waypoints_created++;
         } else {
-            h264_write_scroll_p_frame(&nw, &cfg, offset_mb);
+            h264_write_scroll_p_frame(&nw, &cfg, offset_px);
         }
 
-        if ((i + 1) % 10 == 0) {
-            printf("  Frame %d/%d (offset=%d MB)\n", i + 1, num_frames, offset_mb);
+        if ((i + 1) % 100 == 0) {
+            printf("  Frame %d/%d (offset=%d px)\n", i + 1, num_frames, offset_px);
         }
     }
 

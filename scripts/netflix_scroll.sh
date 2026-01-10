@@ -2,7 +2,7 @@
 # Netflix Scroll Encoder - Full Pipeline Script
 # Creates a smooth scrolling animation from two PNG images
 #
-# Usage: ./scripts/netflix_scroll.sh [image_a.png] [image_b.png] [output.mp4]
+# Usage: ./scripts/netflix_scroll.sh [image_a.png] [image_b.png] [output.mp4] [speed]
 #
 # IMPORTANT: Uses baseline profile encoding to ensure CAVLC compatibility
 # with our generated SPS (profile_idc=66)
@@ -15,6 +15,7 @@ cd "$(dirname "$0")/.."
 IMAGE_A=${1:-frame_a.png}
 IMAGE_B=${2:-frame_b.png}
 OUTPUT=${3:-netflix_scroll_browser.mp4}
+SPEED=${4:-1}  # Pixels per frame (default: 1)
 
 # Configuration
 FPS=30
@@ -25,6 +26,7 @@ echo "=== Netflix Scroll Encoder ==="
 echo "Input A: $IMAGE_A"
 echo "Input B: $IMAGE_B"
 echo "Output:  $OUTPUT"
+echo "Speed:   $SPEED px/frame"
 echo ""
 
 # Check inputs exist
@@ -82,7 +84,7 @@ echo "  Done."
 
 # Step 4: Generate scroll animation
 echo "[4/5] Generating scroll animation (${SCROLL_FRAMES} P-frames)..."
-./h264_scroll_encoder -i "$TMPDIR/two_frames.h264" -o "$TMPDIR/scroll.h264" -n $SCROLL_FRAMES
+./h264_scroll_encoder -i "$TMPDIR/two_frames.h264" -o "$TMPDIR/scroll.h264" -n $SCROLL_FRAMES -S $SPEED
 
 # Step 5: Create browser-compatible MP4
 echo "[5/5] Creating MP4 container..."

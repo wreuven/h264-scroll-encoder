@@ -426,8 +426,10 @@ static void get_mv_prediction_ex(int mb_x, int mb_y, int mb_width,
  *
  * Uses P_Skip optimization: when ref_idx=0 and mvd=(0,0), the macroblock
  * can be skipped entirely - just increment mb_skip_run counter.
+ *
+ * Now supports per-pixel scrolling (not just 16px macroblock boundaries).
  */
-size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_mb) {
+size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_px) {
     uint8_t rbsp[1024 * 1024];  /* 1MB should be plenty for slice data */
     BitWriter bw;
     bitwriter_init(&bw, rbsp, sizeof(rbsp));
@@ -444,26 +446,30 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
     }
 
     /*
-     * Scroll composition logic:
-     * - offset_mb = 0: show all of A
-     * - offset_mb = mb_height: show all of B
+     * Scroll composition logic (now per-pixel):
+     * - offset_px = 0: show all of A
+     * - offset_px = height: show all of B
      *
-     * Boundary: A region is rows [0, mb_height - offset_mb)
-     *           B region is rows [mb_height - offset_mb, mb_height)
+     * The A/B boundary must be at a macroblock boundary (each MB references one frame).
+     * Boundary MB row = (height - offset_px) / 16
+     *
+     * MVs are now in pixels, not MB*16:
+     * - A region: MV.y = offset_px
+     * - B region: MV.y = offset_px - height
      */
 
-    int a_region_end = cfg->mb_height - offset_mb;  /* First row of B region */
+    int a_region_end = (cfg->height - offset_px) / 16;  /* First MB row of B region */
 
-    /* Find best waypoint for A region if offset exceeds direct MV limit */
+    /* Find best waypoint for A region if offset exceeds direct MV limit (496px) */
     int wp_idx_a = -1;
     int wp_offset_a = 0;
-    if (offset_mb > WAYPOINT_INTERVAL_MB && cfg->num_waypoints > 0) {
+    if (offset_px > MV_LIMIT_PX && cfg->num_waypoints > 0) {
         for (int i = 0; i < cfg->num_waypoints; i++) {
             if (!cfg->waypoints[i].valid) continue;
-            int wo = cfg->waypoints[i].offset_mb;
-            if (wo <= offset_mb && wo > wp_offset_a) {
-                int delta = offset_mb - wo;
-                if (delta * 16 <= 496) {  /* Within HW limit */
+            int wo = cfg->waypoints[i].offset_px;
+            if (wo <= offset_px && wo > wp_offset_a) {
+                int delta = offset_px - wo;
+                if (delta <= MV_LIMIT_PX) {  /* Within HW limit */
                     wp_idx_a = i;
                     wp_offset_a = wo;
                 }
@@ -472,22 +478,21 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
     }
 
     /* Find best waypoint for B region if offset is small (B's MV would exceed limit)
-     * B's direct MV = (offset_mb - mb_height) * 16
-     * Limit exceeded when: (offset_mb - mb_height) * 16 < -512
-     *                      i.e., mb_height - offset_mb > 32
-     * Using waypoint: MV = (offset_mb - wp_offset) * 16
+     * B's direct MV = offset_px - height
+     * Limit exceeded when: offset_px - height < -496
+     * Using waypoint: MV = offset_px - wp_offset
      */
     int wp_idx_b = -1;
     int wp_offset_b = 0;
-    int b_direct_mv = (offset_mb - cfg->mb_height) * 16;
-    if (b_direct_mv < -496 && cfg->num_waypoints > 0) {
+    int b_direct_mv = offset_px - cfg->height;
+    if (b_direct_mv < -MV_LIMIT_PX && cfg->num_waypoints > 0) {
         for (int i = 0; i < cfg->num_waypoints; i++) {
             if (!cfg->waypoints[i].valid) continue;
-            int wo = cfg->waypoints[i].offset_mb;
+            int wo = cfg->waypoints[i].offset_px;
             /* Waypoint must be at higher offset than us, so MV is negative but smaller */
-            if (wo > offset_mb) {
-                int delta = offset_mb - wo;  /* Negative */
-                if (delta * 16 >= -496) {  /* Within HW limit */
+            if (wo > offset_px) {
+                int delta = offset_px - wo;  /* Negative */
+                if (delta >= -MV_LIMIT_PX) {  /* Within HW limit */
                     wp_idx_b = i;
                     wp_offset_b = wo;
                     break;  /* First valid waypoint is fine */
@@ -516,22 +521,22 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
                 if (wp_idx_a >= 0) {
                     /* Use waypoint instead of A to keep MV within HW limit */
                     ref_idx = 2 + wp_idx_a;  /* Waypoint ref index */
-                    mv_y = (offset_mb - wp_offset_a) * 16;
+                    mv_y = offset_px - wp_offset_a;
                 } else {
                     /* Use A directly (offset within limit) */
                     ref_idx = 0;
-                    mv_y = offset_mb * 16;  /* Convert MB offset to pixels */
+                    mv_y = offset_px;  /* Per-pixel scroll offset */
                 }
             } else {
                 /* B region */
                 if (wp_idx_b >= 0) {
                     /* Use waypoint instead of B to keep MV within HW limit */
                     ref_idx = 2 + wp_idx_b;  /* Waypoint ref index */
-                    mv_y = (offset_mb - wp_offset_b) * 16;  /* Negative, but smaller */
+                    mv_y = offset_px - wp_offset_b;  /* Negative, but smaller */
                 } else {
                     /* Use B directly */
                     ref_idx = 1;
-                    mv_y = (offset_mb - cfg->mb_height) * 16;
+                    mv_y = offset_px - cfg->height;  /* Per-pixel scroll */
                 }
             }
 
@@ -1154,16 +1159,16 @@ size_t h264_rewrite_as_non_idr_i_frame(NALWriter *nw, H264EncoderConfig *cfg,
  */
 
 /*
- * Check if a waypoint is needed at the given scroll offset
+ * Check if a waypoint is needed at the given scroll offset (in pixels)
  */
-int h264_needs_waypoint(H264EncoderConfig *cfg, int offset_mb) {
-    /* Need waypoint at multiples of WAYPOINT_INTERVAL_MB */
-    if (offset_mb == 0) return 0;  /* Never at offset 0 */
-    if (offset_mb % WAYPOINT_INTERVAL_MB != 0) return 0;
+int h264_needs_waypoint(H264EncoderConfig *cfg, int offset_px) {
+    /* Need waypoint at multiples of MV_LIMIT_PX (496 pixels) */
+    if (offset_px == 0) return 0;  /* Never at offset 0 */
+    if (offset_px % MV_LIMIT_PX != 0) return 0;
 
     /* Check if we already have a waypoint at this offset */
     for (int i = 0; i < cfg->num_waypoints; i++) {
-        if (cfg->waypoints[i].valid && cfg->waypoints[i].offset_mb == offset_mb) {
+        if (cfg->waypoints[i].valid && cfg->waypoints[i].offset_px == offset_px) {
             return 0;  /* Already have this waypoint */
         }
     }
@@ -1172,10 +1177,10 @@ int h264_needs_waypoint(H264EncoderConfig *cfg, int offset_mb) {
 }
 
 /*
- * Find the best waypoint to use for a given scroll offset
+ * Find the best waypoint to use for a given scroll offset (in pixels)
  * Returns the waypoint index, or -1 if should use original refs
  */
-static int find_best_waypoint(H264EncoderConfig *cfg, int offset_mb) {
+static int find_best_waypoint(H264EncoderConfig *cfg, int offset_px) {
     int best_idx = -1;
     int best_offset = 0;
 
@@ -1183,11 +1188,11 @@ static int find_best_waypoint(H264EncoderConfig *cfg, int offset_mb) {
     for (int i = 0; i < cfg->num_waypoints; i++) {
         if (!cfg->waypoints[i].valid) continue;
 
-        int wp_offset = cfg->waypoints[i].offset_mb;
-        if (wp_offset <= offset_mb && wp_offset > best_offset) {
+        int wp_offset = cfg->waypoints[i].offset_px;
+        if (wp_offset <= offset_px && wp_offset > best_offset) {
             /* Check if using this waypoint keeps MV within limit */
-            int delta = offset_mb - wp_offset;
-            if (delta * 16 <= 496) {  /* 496px = 31 MB, within HW limit */
+            int delta = offset_px - wp_offset;
+            if (delta <= MV_LIMIT_PX) {  /* Within HW limit (496px) */
                 best_idx = i;
                 best_offset = wp_offset;
             }
@@ -1291,7 +1296,7 @@ static void h264_write_p_slice_header_waypoint(BitWriter *bw, H264EncoderConfig 
  * This creates a P-frame at the given scroll offset and marks it as
  * a long-term reference for subsequent frames to use.
  */
-size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_mb) {
+size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_px) {
     uint8_t rbsp[1024 * 1024];
     BitWriter bw;
     bitwriter_init(&bw, rbsp, sizeof(rbsp));
@@ -1307,7 +1312,7 @@ size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int of
                                         1, long_term_idx);  /* is_reference=1 */
 
     /* Write macroblock data (same as regular scroll frame) */
-    int a_region_end = cfg->mb_height - offset_mb;
+    int a_region_end = (cfg->height - offset_px) / 16;
 
     MVInfo *above_row = calloc(cfg->mb_width, sizeof(MVInfo));
     MVInfo *current_row = calloc(cfg->mb_width, sizeof(MVInfo));
@@ -1315,7 +1320,7 @@ size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int of
     int skip_count = 0;
 
     /* For waypoint, we may need to use an existing waypoint for the A region */
-    int wp_idx = find_best_waypoint(cfg, offset_mb);
+    int wp_idx = find_best_waypoint(cfg, offset_px);
 
     for (int mb_y = 0; mb_y < cfg->mb_height; mb_y++) {
         left.available = 0;
@@ -1327,20 +1332,20 @@ size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int of
 
             if (mb_y < a_region_end) {
                 /* A region */
-                if (wp_idx >= 0 && offset_mb > WAYPOINT_INTERVAL_MB) {
+                if (wp_idx >= 0 && offset_px > MV_LIMIT_PX) {
                     /* Use waypoint instead of A */
-                    int wp_offset = cfg->waypoints[wp_idx].offset_mb;
+                    int wp_offset = cfg->waypoints[wp_idx].offset_px;
                     ref_idx = 2 + wp_idx;  /* Waypoint ref index */
-                    mv_y = (offset_mb - wp_offset) * 16;
+                    mv_y = offset_px - wp_offset;
                 } else {
                     /* Use A directly */
                     ref_idx = 0;
-                    mv_y = offset_mb * 16;
+                    mv_y = offset_px;
                 }
             } else {
                 /* B region */
                 ref_idx = 1;
-                mv_y = (offset_mb - cfg->mb_height) * 16;
+                mv_y = offset_px - cfg->height;
             }
 
             int mv_x_qpel = mv_x * 4;
@@ -1387,7 +1392,7 @@ size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int of
 
     /* Register this waypoint */
     if (cfg->num_waypoints < MAX_WAYPOINTS) {
-        cfg->waypoints[cfg->num_waypoints].offset_mb = offset_mb;
+        cfg->waypoints[cfg->num_waypoints].offset_px = offset_px;
         cfg->waypoints[cfg->num_waypoints].long_term_idx = long_term_idx;
         cfg->waypoints[cfg->num_waypoints].valid = 1;
         cfg->num_waypoints++;

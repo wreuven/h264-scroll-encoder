@@ -31,12 +31,13 @@
 /* Maximum number of waypoint references */
 #define MAX_WAYPOINTS 8
 
-/* Hardware MV limit: 31 MB = 496 pixels = 1984 qpel (safely under 2048) */
-#define WAYPOINT_INTERVAL_MB 31
+/* Hardware MV limit: 496 pixels (safely under 512) */
+#define MV_LIMIT_PX 496
+#define WAYPOINT_INTERVAL_MB 31  /* Legacy, kept for compatibility */
 
 /* Waypoint info for intermediate reference frames */
 typedef struct {
-    int offset_mb;          /* Scroll offset at which this waypoint was created */
+    int offset_px;          /* Scroll offset in pixels at which this waypoint was created */
     int long_term_idx;      /* Long-term frame index (2, 3, 4, ...) */
     int valid;              /* Whether this waypoint is active */
 } WaypointInfo;
@@ -104,13 +105,14 @@ void h264_write_p16x16_mb(BitWriter *bw, int ref_idx, int mvd_x, int mvd_y);
  * Parameters:
  *   nw          - NAL writer for output
  *   cfg         - Encoder config
- *   offset_mb   - Scroll offset in macroblock rows (0 to mb_height)
+ *   offset_px   - Scroll offset in pixels (0 to height)
  *
  * The scroll composition:
- *   - For mb_y in [0, mb_height - offset_mb): use ref A with MV (0, -offset_mb*16)
- *   - For mb_y in [mb_height - offset_mb, mb_height): use ref B with appropriate MV
+ *   - A region: MV.y = offset_px (smooth per-pixel scrolling)
+ *   - B region: MV.y = offset_px - height (smooth per-pixel scrolling)
+ *   - A/B boundary is at MB row (height - offset_px) / 16
  */
-size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_mb);
+size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_px);
 
 /*
  * Write a waypoint P-frame (reference P-frame for extended scroll range)
@@ -122,19 +124,19 @@ size_t h264_write_scroll_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offs
  * Parameters:
  *   nw          - NAL writer for output
  *   cfg         - Encoder config
- *   offset_mb   - Scroll offset for this waypoint
+ *   offset_px   - Scroll offset in pixels for this waypoint
  *
  * Returns: bytes written
  */
-size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_mb);
+size_t h264_write_waypoint_p_frame(NALWriter *nw, H264EncoderConfig *cfg, int offset_px);
 
 /*
  * Check if a waypoint is needed at the given scroll offset
  *
  * Returns 1 if a waypoint should be inserted, 0 otherwise.
- * Waypoints are needed every 31 MB to keep MVs within hardware limits.
+ * Waypoints are needed every 496 pixels to keep MVs within hardware limits.
  */
-int h264_needs_waypoint(H264EncoderConfig *cfg, int offset_mb);
+int h264_needs_waypoint(H264EncoderConfig *cfg, int offset_px);
 
 /*
  * Generate a minimal SPS for Baseline profile
