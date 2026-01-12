@@ -1,8 +1,19 @@
 # Build artifacts
 build/
 *.o
+composer
 h264_scroll_encoder
 trans_resizer
+
+# Generated reference frames
+ref_a.h264
+ref_b.h264
+
+# Test output
+*.mp4
+test_output.h264
+scroll.h264
+output.h264
 
 # Test outputs
 test_output/
