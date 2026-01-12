@@ -2,6 +2,7 @@
 build/
 *.o
 h264_scroll_encoder
+trans_resizer
 
 # Test outputs
 test_output/
